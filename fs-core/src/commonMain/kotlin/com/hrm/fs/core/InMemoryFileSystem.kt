@@ -9,6 +9,7 @@ import com.hrm.fs.api.FsError
 import com.hrm.fs.api.FsEvent
 import com.hrm.fs.api.FsEventKind
 import com.hrm.fs.api.FsMeta
+import com.hrm.fs.api.FsMetrics
 import com.hrm.fs.api.FsPermissions
 import com.hrm.fs.api.FsStorage
 import com.hrm.fs.api.FsType
@@ -16,13 +17,13 @@ import com.hrm.fs.api.MountOptions
 import com.hrm.fs.api.OpenMode
 import com.hrm.fs.api.PathUtils
 import com.hrm.fs.api.PendingMount
+import com.hrm.fs.core.VfsMetricsCollector.Op
 import com.hrm.fs.core.persistence.PersistenceConfig
 import com.hrm.fs.core.persistence.SnapshotPermissions
 import com.hrm.fs.core.persistence.WalEntry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.launch
@@ -32,11 +33,12 @@ import kotlinx.coroutines.sync.withLock
 /**
  * 虚拟文件系统实现（门面层）。
  *
- * 组合四个内部组件完成所有功能：
+ * 组合内部组件完成所有功能：
  * - [VfsTree]               — 纯内存文件树的增删改查 / 快照 / WAL
  * - [MountTable]            — 挂载表管理 + 最长前缀匹配
  * - [VfsEventBus]           — 事件发布 / 订阅
  * - [VfsPersistenceManager] — WAL / Snapshot / Mount 持久化
+ * - [VfsMetricsCollector]   — IO 统计与可观测性
  */
 internal class InMemoryFileSystem(
     storage: FsStorage? = null,
@@ -49,12 +51,29 @@ internal class InMemoryFileSystem(
     private val mountTable = MountTable()
     private val eventBus = VfsEventBus()
     private val persistence = VfsPersistenceManager(storage, persistenceConfig)
+    private val mc = VfsMetricsCollector()
+    internal val fileLockManager = VfsFileLockManager()
+
+    /** 挂载点 stat 结果的 LRU 缓存。 */
+    private val statCache = VfsCache<String, FsMeta>(256)
+
+    /** 挂载点 readDir 结果的 LRU 缓存。 */
+    private val readDirCache = VfsCache<String, List<FsEntry>>(128)
 
     /** 用于管理所有 disk watcher 协程的父 scope。 */
     private val watchScope = watcherScope ?: CoroutineScope(SupervisorJob())
 
     /** 每个挂载点对应的 watcher job，用于 unmount 时取消。 */
     private val watcherJobs = LinkedHashMap<String, Job>()
+
+
+    // ═══════════════════════════════════════════════════════════
+    // 可观测性
+    // ═══════════════════════════════════════════════════════════
+
+    override fun metrics(): FsMetrics = mc.snapshot()
+
+    override fun resetMetrics() = mc.reset()
 
     // ═══════════════════════════════════════════════════════════
     // mount / unmount
@@ -64,27 +83,35 @@ internal class InMemoryFileSystem(
         virtualPath: String,
         diskOps: DiskFileOperations,
         options: MountOptions
-    ): Result<Unit> = locked {
-        val normalized = PathUtils.normalize(virtualPath)
-        mountTable.mount(normalized, diskOps, options).getOrElse { return@locked Result.failure(it) }
-        tree.ensureDirPath(normalized)
-        persistence.persistMounts(mountTable.toMountInfoList())
-
-        // 如果 DiskFileOperations 同时实现了 DiskFileWatcher，自动启动监听
-        startDiskWatcherIfSupported(normalized, diskOps)
-
-        Result.success(Unit)
+    ): Result<Unit> {
+        val mark = mc.begin()
+        val result = locked {
+            val normalized = PathUtils.normalize(virtualPath)
+            mountTable.mount(normalized, diskOps, options)
+                .getOrElse { return@locked Result.failure(it) }
+            tree.ensureDirPath(normalized)
+            persistence.persistMounts(mountTable.toMountInfoList())
+            startDiskWatcherIfSupported(normalized, diskOps)
+            Result.success(Unit)
+        }
+        mc.end(Op.MOUNT, mark, result)
+        return result
     }
 
-    override suspend fun unmount(virtualPath: String): Result<Unit> = locked {
-        val normalized = PathUtils.normalize(virtualPath)
-
-        // 停止该挂载点的 disk watcher
-        stopDiskWatcher(normalized)
-
-        mountTable.unmount(normalized).getOrElse { return@locked Result.failure(it) }
-        persistence.persistMounts(mountTable.toMountInfoList())
-        Result.success(Unit)
+    override suspend fun unmount(virtualPath: String): Result<Unit> {
+        val mark = mc.begin()
+        val result = locked {
+            val normalized = PathUtils.normalize(virtualPath)
+            stopDiskWatcher(normalized)
+            mountTable.unmount(normalized).getOrElse { return@locked Result.failure(it) }
+            // 清除该挂载点下的所有缓存
+            statCache.removeByPrefix(normalized)
+            readDirCache.removeByPrefix(normalized)
+            persistence.persistMounts(mountTable.toMountInfoList())
+            Result.success(Unit)
+        }
+        mc.end(Op.UNMOUNT, mark, result)
+        return result
     }
 
     override suspend fun listMounts(): List<String> = locked {
@@ -102,163 +129,223 @@ internal class InMemoryFileSystem(
     // sync（手动同步挂载点与磁盘状态）
     // ═══════════════════════════════════════════════════════════
 
-    override suspend fun sync(path: String): Result<List<FsEvent>> = locked {
-        ensureLoaded()
-        val normalized = PathUtils.normalize(path)
-        val match = mountTable.findMount(normalized)
-            ?: return@locked Result.failure(FsError.NotMounted(normalized))
+    override suspend fun sync(path: String): Result<List<FsEvent>> {
+        val mark = mc.begin()
+        val result = locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            val match = mountTable.findMount(normalized)
+                ?: return@locked Result.failure(FsError.NotMounted(normalized))
 
-        val mountPoint = match.mountPoint
-        val diskOps = match.diskOps
-        val events = mutableListOf<FsEvent>()
+            val mountPoint = match.mountPoint
+            val diskOps = match.diskOps
+            val events = mutableListOf<FsEvent>()
 
-        // 递归扫描磁盘目录，构建当前磁盘快照
-        val diskEntries = mutableMapOf<String, FsType>() // relativePath -> FsType
-        suspend fun scanDisk(diskPath: String, prefix: String) {
-            val list = diskOps.list(diskPath).getOrNull() ?: return
-            for (entry in list) {
-                val rel = "$prefix/${entry.name}"
-                diskEntries[rel] = entry.type
-                if (entry.type == FsType.DIRECTORY) {
-                    scanDisk("$diskPath/${entry.name}", rel)
+            val diskEntries = mutableMapOf<String, FsType>()
+            suspend fun scanDisk(diskPath: String, prefix: String) {
+                val list = diskOps.list(diskPath).getOrNull() ?: return
+                for (entry in list) {
+                    val rel = "$prefix/${entry.name}"
+                    diskEntries[rel] = entry.type
+                    if (entry.type == FsType.DIRECTORY) {
+                        scanDisk("$diskPath/${entry.name}", rel)
+                    }
                 }
             }
-        }
-        scanDisk(match.relativePath, "")
+            scanDisk(match.relativePath, "")
 
-        // 递归扫描 VFS 中该挂载点下已知的条目
-        val vfsEntries = mutableMapOf<String, FsType>()
-        suspend fun scanVfs(vfsPath: String, prefix: String) {
-            val list = tree.readDir(vfsPath).getOrNull() ?: return
-            for (entry in list) {
-                val rel = "$prefix/${entry.name}"
-                vfsEntries[rel] = entry.type
-                if (entry.type == FsType.DIRECTORY) {
-                    scanVfs("$vfsPath/${entry.name}", rel)
-                }
+            for ((rel, _) in diskEntries) {
+                val vfsPath = "$mountPoint$rel"
+                invalidateCache(vfsPath)
+                events.add(FsEvent(vfsPath, FsEventKind.MODIFIED))
+                eventBus.emit(vfsPath, FsEventKind.MODIFIED)
             }
-        }
-        // VFS tree 中挂载点目录下的虚拟条目（非磁盘条目）可能为空，这里只用磁盘做对比
 
-        // 如果挂载点 readDir 走的是 disk，就直接对比上次 readDir 缓存和当前磁盘
-        // 简化方案：所有磁盘上的条目都发出事件，让 watcher 去重
-        for ((rel, type) in diskEntries) {
-            val vfsPath = "$mountPoint$rel"
-            events.add(FsEvent(vfsPath, FsEventKind.MODIFIED))
-            eventBus.emit(vfsPath, FsEventKind.MODIFIED)
+            Result.success(events)
         }
-
-        Result.success(events)
+        mc.end(Op.SYNC, mark, result)
+        return result
     }
 
     // ═══════════════════════════════════════════════════════════
     // 基础 CRUD
     // ═══════════════════════════════════════════════════════════
 
-    override suspend fun createFile(path: String): Result<Unit> = locked {
-        ensureLoaded()
-        val normalized = PathUtils.normalize(path)
-        val match = mountTable.findMount(normalized)
-        if (match != null) {
-            if (match.options.readOnly) return@locked readOnlyError(normalized)
-            val result = match.diskOps.createFile(match.relativePath)
-            if (result.isSuccess) eventBus.emit(normalized, FsEventKind.CREATED)
-            return@locked result
-        }
-        tree.createFile(normalized).also { result ->
-            if (result.isSuccess) {
-                walAppend(WalEntry.CreateFile(normalized))
-                eventBus.emit(normalized, FsEventKind.CREATED)
+    override suspend fun createFile(path: String): Result<Unit> {
+        val mark = mc.begin()
+        val result = locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            val match = mountTable.findMount(normalized)
+            if (match != null) {
+                if (match.options.readOnly) return@locked readOnlyError(normalized)
+                val r = match.diskOps.createFile(match.relativePath)
+                if (r.isSuccess) {
+                    invalidateCache(normalized)
+                    eventBus.emit(normalized, FsEventKind.CREATED)
+                }
+                return@locked r
+            }
+            tree.createFile(normalized).also { r ->
+                if (r.isSuccess) {
+                    walAppend(WalEntry.CreateFile(normalized))
+                    eventBus.emit(normalized, FsEventKind.CREATED)
+                }
             }
         }
+        mc.end(Op.CREATE_FILE, mark, result)
+        return result
     }
 
-    override suspend fun createDir(path: String): Result<Unit> = locked {
-        ensureLoaded()
-        val normalized = PathUtils.normalize(path)
-        if (normalized == "/") return@locked Result.success(Unit)
-        val match = mountTable.findMount(normalized)
-        if (match != null) {
-            if (match.options.readOnly) return@locked readOnlyError(normalized)
-            val result = match.diskOps.createDir(match.relativePath)
-            if (result.isSuccess) eventBus.emit(normalized, FsEventKind.CREATED)
-            return@locked result
-        }
-        tree.createDir(normalized).also { result ->
-            if (result.isSuccess) {
-                walAppend(WalEntry.CreateDir(normalized))
-                eventBus.emit(normalized, FsEventKind.CREATED)
+    override suspend fun createDir(path: String): Result<Unit> {
+        val mark = mc.begin()
+        val result = locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            if (normalized == "/") return@locked Result.success(Unit)
+            val match = mountTable.findMount(normalized)
+            if (match != null) {
+                if (match.options.readOnly) return@locked readOnlyError(normalized)
+                val r = match.diskOps.createDir(match.relativePath)
+                if (r.isSuccess) {
+                    invalidateCache(normalized)
+                    eventBus.emit(normalized, FsEventKind.CREATED)
+                }
+                return@locked r
+            }
+            tree.createDir(normalized).also { r ->
+                if (r.isSuccess) {
+                    walAppend(WalEntry.CreateDir(normalized))
+                    eventBus.emit(normalized, FsEventKind.CREATED)
+                }
             }
         }
+        mc.end(Op.CREATE_DIR, mark, result)
+        return result
     }
 
-    override suspend fun open(path: String, mode: OpenMode): Result<FileHandle> = locked {
-        ensureLoaded()
-        val normalized = PathUtils.normalize(path)
-        val match = mountTable.findMount(normalized)
-        if (match != null) {
-            if (match.options.readOnly && mode != OpenMode.READ) {
-                return@locked Result.failure(FsError.PermissionDenied("挂载点只读: $normalized"))
+    override suspend fun open(path: String, mode: OpenMode): Result<FileHandle> {
+        val mark = mc.begin()
+        val result = locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            val match = mountTable.findMount(normalized)
+            if (match != null) {
+                if (match.options.readOnly && mode != OpenMode.READ) {
+                    return@locked Result.failure(FsError.PermissionDenied("挂载点只读: $normalized"))
+                }
+                return@locked Result.success(
+                    DiskFileHandle(
+                        match.diskOps,
+                        match.relativePath,
+                        mode,
+                        normalized,
+                        fileLockManager
+                    )
+                )
             }
-            return@locked Result.success(DiskFileHandle(match.diskOps, match.relativePath, mode))
+            val node =
+                tree.resolveNodeOrError(normalized).getOrElse { return@locked Result.failure(it) }
+            if (node !is FileNode) return@locked Result.failure(FsError.NotFile(normalized))
+            if (!hasAccess(node.permissions, mode)) {
+                return@locked Result.failure(FsError.PermissionDenied(normalized))
+            }
+            Result.success(InMemoryFileHandle(this, node, mode, normalized, fileLockManager))
         }
-        val node = tree.resolveNodeOrError(normalized).getOrElse { return@locked Result.failure(it) }
-        if (node !is FileNode) return@locked Result.failure(FsError.NotFile(normalized))
-        if (!hasAccess(node.permissions, mode)) {
-            return@locked Result.failure(FsError.PermissionDenied(normalized))
-        }
-        Result.success(InMemoryFileHandle(this, node, mode))
+        mc.end(Op.OPEN, mark, result)
+        return result
     }
 
-    override suspend fun readDir(path: String): Result<List<FsEntry>> = locked {
-        ensureLoaded()
-        val normalized = PathUtils.normalize(path)
-        val match = mountTable.findMount(normalized)
-        if (match != null) return@locked match.diskOps.list(match.relativePath)
-        tree.readDir(normalized)
+    override suspend fun readDir(path: String): Result<List<FsEntry>> {
+        val mark = mc.begin()
+        val result = locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            val match = mountTable.findMount(normalized)
+            if (match != null) {
+                // 缓存命中
+                readDirCache.get(normalized)?.let { return@locked Result.success(it) }
+                val r = match.diskOps.list(match.relativePath)
+                if (r.isSuccess) readDirCache.put(normalized, r.getOrThrow())
+                return@locked r
+            }
+            tree.readDir(normalized)
+        }
+        mc.end(Op.READ_DIR, mark, result)
+        return result
     }
 
-    override suspend fun stat(path: String): Result<FsMeta> = locked {
-        ensureLoaded()
-        val normalized = PathUtils.normalize(path)
-        val match = mountTable.findMount(normalized)
-        if (match != null) {
-            return@locked match.diskOps.stat(match.relativePath).map { it.copy(path = normalized) }
+    override suspend fun stat(path: String): Result<FsMeta> {
+        val mark = mc.begin()
+        val result = locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            val match = mountTable.findMount(normalized)
+            if (match != null) {
+                // 缓存命中
+                statCache.get(normalized)?.let { return@locked Result.success(it) }
+                val r = match.diskOps.stat(match.relativePath).map { it.copy(path = normalized) }
+                if (r.isSuccess) statCache.put(normalized, r.getOrThrow())
+                return@locked r
+            }
+            tree.stat(normalized)
         }
-        tree.stat(normalized)
+        mc.end(Op.STAT, mark, result)
+        return result
     }
 
-    override suspend fun delete(path: String): Result<Unit> = locked {
-        ensureLoaded()
-        val normalized = PathUtils.normalize(path)
-        if (normalized == "/") return@locked Result.failure(FsError.PermissionDenied("/"))
-        if (mountTable.isMountPoint(normalized)) {
-            return@locked Result.failure(FsError.PermissionDenied("不能删除挂载点: $normalized"))
-        }
-        val match = mountTable.findMount(normalized)
-        if (match != null) {
-            if (match.options.readOnly) return@locked readOnlyError(normalized)
-            val result = match.diskOps.delete(match.relativePath)
-            if (result.isSuccess) eventBus.emit(normalized, FsEventKind.DELETED)
-            return@locked result
-        }
-        tree.delete(normalized).also { result ->
-            if (result.isSuccess) {
-                walAppend(WalEntry.Delete(normalized))
-                eventBus.emit(normalized, FsEventKind.DELETED)
+    override suspend fun delete(path: String): Result<Unit> {
+        val mark = mc.begin()
+        val result = locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            if (normalized == "/") return@locked Result.failure(FsError.PermissionDenied("/"))
+            if (mountTable.isMountPoint(normalized)) {
+                return@locked Result.failure(FsError.PermissionDenied("不能删除挂载点: $normalized"))
+            }
+            if (fileLockManager.isLocked(normalized)) {
+                return@locked Result.failure(FsError.Locked(normalized))
+            }
+            val match = mountTable.findMount(normalized)
+            if (match != null) {
+                if (match.options.readOnly) return@locked readOnlyError(normalized)
+                val r = match.diskOps.delete(match.relativePath)
+                if (r.isSuccess) {
+                    invalidateCache(normalized)
+                    eventBus.emit(normalized, FsEventKind.DELETED)
+                }
+                return@locked r
+            }
+            tree.delete(normalized).also { r ->
+                if (r.isSuccess) {
+                    walAppend(WalEntry.Delete(normalized))
+                    eventBus.emit(normalized, FsEventKind.DELETED)
+                }
             }
         }
+        mc.end(Op.DELETE, mark, result)
+        return result
     }
 
-    override suspend fun setPermissions(path: String, permissions: FsPermissions): Result<Unit> = locked {
-        ensureLoaded()
-        val normalized = PathUtils.normalize(path)
-        if (mountTable.findMount(normalized) != null) return@locked Result.success(Unit)
-        tree.setPermissions(normalized, permissions).also { result ->
-            if (result.isSuccess) {
-                walAppend(WalEntry.SetPermissions(normalized, SnapshotPermissions.from(permissions)))
+    override suspend fun setPermissions(path: String, permissions: FsPermissions): Result<Unit> {
+        val mark = mc.begin()
+        val result = locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            if (mountTable.findMount(normalized) != null) return@locked Result.success(Unit)
+            tree.setPermissions(normalized, permissions).also { r ->
+                if (r.isSuccess) {
+                    walAppend(
+                        WalEntry.SetPermissions(
+                            normalized,
+                            SnapshotPermissions.from(permissions)
+                        )
+                    )
+                }
             }
         }
+        mc.end(Op.SET_PERMISSIONS, mark, result)
+        return result
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -303,32 +390,60 @@ internal class InMemoryFileSystem(
     // ═══════════════════════════════════════════════════════════
 
     override suspend fun readAll(path: String): Result<ByteArray> {
-        val handle = open(path, OpenMode.READ).getOrElse { return Result.failure(it) }
-        return try {
+        val mark = mc.begin()
+        val handle = open(path, OpenMode.READ).getOrElse {
+            val fail = Result.failure<ByteArray>(it)
+            mc.end(Op.READ_ALL, mark, fail)
+            return fail
+        }
+        val result = try {
             val meta = stat(path).getOrElse { return Result.failure(it) }
-            handle.readAt(0, meta.size.toInt())
+            val r = handle.readAt(0, meta.size.toInt())
+            if (r.isSuccess) mc.addBytesRead(r.getOrThrow().size.toLong())
+            r
         } finally {
             handle.close()
         }
+        mc.end(Op.READ_ALL, mark, result)
+        return result
     }
 
     override suspend fun writeAll(path: String, data: ByteArray): Result<Unit> {
+        val mark = mc.begin()
         val normalized = PathUtils.normalize(path)
         val parentPath = normalized.substringBeforeLast('/', "/")
         if (parentPath != "/") {
-            createDirRecursive(parentPath).getOrElse { return Result.failure(it) }
+            createDirRecursive(parentPath).getOrElse {
+                val fail = Result.failure<Unit>(it)
+                mc.end(Op.WRITE_ALL, mark, fail)
+                return fail
+            }
         }
         if (stat(normalized).isFailure) {
-            createFile(normalized).getOrElse { return Result.failure(it) }
+            createFile(normalized).getOrElse {
+                val fail = Result.failure<Unit>(it)
+                mc.end(Op.WRITE_ALL, mark, fail)
+                return fail
+            }
         }
-        val handle = open(normalized, OpenMode.WRITE).getOrElse { return Result.failure(it) }
-        return try {
-            val result = handle.writeAt(0, data)
-            if (result.isSuccess) eventBus.emit(normalized, FsEventKind.MODIFIED)
-            result
+        val handle = open(normalized, OpenMode.WRITE).getOrElse {
+            val fail = Result.failure<Unit>(it)
+            mc.end(Op.WRITE_ALL, mark, fail)
+            return fail
+        }
+        val result = try {
+            val r = handle.writeAt(0, data)
+            if (r.isSuccess) {
+                mc.addBytesWritten(data.size.toLong())
+                invalidateCache(normalized)
+                eventBus.emit(normalized, FsEventKind.MODIFIED)
+            }
+            r
         } finally {
             handle.close()
         }
+        mc.end(Op.WRITE_ALL, mark, result)
+        return result
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -336,6 +451,13 @@ internal class InMemoryFileSystem(
     // ═══════════════════════════════════════════════════════════
 
     override suspend fun copy(srcPath: String, dstPath: String): Result<Unit> {
+        val mark = mc.begin()
+        val result = copyInternal(srcPath, dstPath)
+        mc.end(Op.COPY, mark, result)
+        return result
+    }
+
+    private suspend fun copyInternal(srcPath: String, dstPath: String): Result<Unit> {
         val src = PathUtils.normalize(srcPath)
         val dst = PathUtils.normalize(dstPath)
         val meta = stat(src).getOrElse { return Result.failure(it) }
@@ -346,14 +468,22 @@ internal class InMemoryFileSystem(
         createDirRecursive(dst).getOrElse { return Result.failure(it) }
         val entries = readDir(src).getOrElse { return Result.failure(it) }
         for (entry in entries) {
-            copy("$src/${entry.name}", "$dst/${entry.name}").getOrElse { return Result.failure(it) }
+            copyInternal(
+                "$src/${entry.name}",
+                "$dst/${entry.name}"
+            ).getOrElse { return Result.failure(it) }
         }
         return Result.success(Unit)
     }
 
     override suspend fun move(srcPath: String, dstPath: String): Result<Unit> {
-        copy(srcPath, dstPath).getOrElse { return Result.failure(it) }
-        return deleteRecursive(srcPath)
+        val mark = mc.begin()
+        val result = run {
+            copyInternal(srcPath, dstPath).getOrElse { return@run Result.failure(it) }
+            deleteRecursive(srcPath)
+        }
+        mc.end(Op.MOVE, mark, result)
+        return result
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -411,43 +541,37 @@ internal class InMemoryFileSystem(
     // InMemoryFileHandle 的 readAt / writeAt（内部调用）
     // ═══════════════════════════════════════════════════════════
 
-    internal suspend fun readAt(node: FileNode, offset: Long, length: Int): Result<ByteArray> = locked {
-        tree.readAt(node, offset, length)
-    }
+    internal suspend fun readAt(node: FileNode, offset: Long, length: Int): Result<ByteArray> =
+        locked {
+            tree.readAt(node, offset, length)
+        }
 
-    internal suspend fun writeAt(node: FileNode, offset: Long, data: ByteArray): Result<Unit> = locked {
-        tree.writeAt(node, offset, data).also { result ->
-            if (result.isSuccess) {
-                walAppend(WalEntry.Write(tree.pathForNode(node), offset, data))
+    internal suspend fun writeAt(node: FileNode, offset: Long, data: ByteArray): Result<Unit> =
+        locked {
+            tree.writeAt(node, offset, data).also { result ->
+                if (result.isSuccess) {
+                    walAppend(WalEntry.Write(tree.pathForNode(node), offset, data))
+                }
             }
         }
-    }
 
     // ═══════════════════════════════════════════════════════════
     // Disk Watcher 管理
     // ═══════════════════════════════════════════════════════════
 
-    /**
-     * 如果 [diskOps] 同时实现了 [DiskFileWatcher]，则启动监听，
-     * 将磁盘事件的相对路径转为虚拟路径后转发给 [VfsEventBus]。
-     */
     private fun startDiskWatcherIfSupported(mountPoint: String, diskOps: DiskFileOperations) {
         val watcher = diskOps as? DiskFileWatcher ?: return
-
         val job = watchScope.launch {
             watcher.watchDisk(this).collect { diskEvent ->
-                // 磁盘相对路径 -> 虚拟路径
                 val virtualPath = if (diskEvent.relativePath == "/") mountPoint
                 else "$mountPoint${diskEvent.relativePath}"
+                invalidateCache(virtualPath)
                 eventBus.emit(virtualPath, diskEvent.kind)
             }
         }
         watcherJobs[mountPoint] = job
     }
 
-    /**
-     * 停止指定挂载点的 disk watcher。
-     */
     private fun stopDiskWatcher(mountPoint: String) {
         watcherJobs.remove(mountPoint)?.cancel()
     }
@@ -468,6 +592,15 @@ internal class InMemoryFileSystem(
     }
 
     private suspend fun <T> locked(block: suspend () -> T): T = mutex.withLock { block() }
+
+    /** 失效路径本身及其父目录的缓存。 */
+    private fun invalidateCache(path: String) {
+        statCache.remove(path)
+        readDirCache.remove(path)
+        // 父目录的 readDir 缓存也需要失效
+        val parent = path.substringBeforeLast('/', "/")
+        readDirCache.remove(parent)
+    }
 
     private fun hasAccess(perms: FsPermissions, mode: OpenMode): Boolean = when (mode) {
         OpenMode.READ -> perms.canRead()

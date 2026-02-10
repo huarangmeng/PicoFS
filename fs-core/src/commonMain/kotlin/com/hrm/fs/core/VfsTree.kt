@@ -51,8 +51,16 @@ internal class VfsTree {
     fun createFile(normalized: String): Result<Unit> {
         val (parent, name) = splitParent(normalized)
         val parentNode = resolveDirOrError(parent).getOrElse { return Result.failure(it) }
-        if (!parentNode.permissions.canWrite()) return Result.failure(FsError.PermissionDenied(parent))
-        if (parentNode.children.containsKey(name)) return Result.failure(FsError.AlreadyExists(normalized))
+        if (!parentNode.permissions.canWrite()) return Result.failure(
+            FsError.PermissionDenied(
+                parent
+            )
+        )
+        if (parentNode.children.containsKey(name)) return Result.failure(
+            FsError.AlreadyExists(
+                normalized
+            )
+        )
         val now = nowMillis()
         parentNode.children[name] = FileNode(name, now, now, FsPermissions.FULL)
         parentNode.modifiedAtMillis = now
@@ -63,8 +71,16 @@ internal class VfsTree {
         if (normalized == "/") return Result.success(Unit)
         val (parent, name) = splitParent(normalized)
         val parentNode = resolveDirOrError(parent).getOrElse { return Result.failure(it) }
-        if (!parentNode.permissions.canWrite()) return Result.failure(FsError.PermissionDenied(parent))
-        if (parentNode.children.containsKey(name)) return Result.failure(FsError.AlreadyExists(normalized))
+        if (!parentNode.permissions.canWrite()) return Result.failure(
+            FsError.PermissionDenied(
+                parent
+            )
+        )
+        if (parentNode.children.containsKey(name)) return Result.failure(
+            FsError.AlreadyExists(
+                normalized
+            )
+        )
         val now = nowMillis()
         parentNode.children[name] = DirNode(name, now, now, FsPermissions.FULL)
         parentNode.modifiedAtMillis = now
@@ -77,9 +93,17 @@ internal class VfsTree {
         if (normalized == "/") return Result.failure(FsError.PermissionDenied("/"))
         val (parent, name) = splitParent(normalized)
         val parentNode = resolveDirOrError(parent).getOrElse { return Result.failure(it) }
-        if (!parentNode.permissions.canWrite()) return Result.failure(FsError.PermissionDenied(parent))
+        if (!parentNode.permissions.canWrite()) return Result.failure(
+            FsError.PermissionDenied(
+                parent
+            )
+        )
         val node = parentNode.children[name] ?: return Result.failure(FsError.NotFound(normalized))
-        if (node is DirNode && node.children.isNotEmpty()) return Result.failure(FsError.PermissionDenied(normalized))
+        if (node is DirNode && node.children.isNotEmpty()) return Result.failure(
+            FsError.PermissionDenied(
+                normalized
+            )
+        )
         parentNode.children.remove(name)
         parentNode.modifiedAtMillis = nowMillis()
         return Result.success(Unit)
@@ -117,7 +141,6 @@ internal class VfsTree {
     }
 
     // ── 文件读写（内存） ──────────────────────────────────────
-
     fun readAt(node: FileNode, offset: Long, length: Int): Result<ByteArray> {
         if (!node.permissions.canRead()) return Result.failure(FsError.PermissionDenied(node.name))
         if (offset < 0 || length < 0) return Result.failure(FsError.InvalidPath("offset/length"))
@@ -141,7 +164,6 @@ internal class VfsTree {
     }
 
     // ── 确保挂载点目录存在 ────────────────────────────────────
-
     fun ensureDirPath(mountPath: String) {
         val parts = mountPath.removePrefix("/").split("/").filter { it.isNotBlank() }
         var current: DirNode = root
@@ -163,7 +185,9 @@ internal class VfsTree {
     fun pathForNode(node: FileNode): String {
         val result = StringBuilder()
         fun dfs(current: VfsNode, target: FileNode, prefix: String): Boolean {
-            if (current == target) { result.append(prefix); return true }
+            if (current == target) {
+                result.append(prefix); return true
+            }
             if (current is DirNode) {
                 for ((name, child) in current.children) {
                     val next = if (prefix == "/") "/$name" else "$prefix/$name"
@@ -193,7 +217,10 @@ internal class VfsTree {
                 is WalEntry.CreateDir -> createDirInternal(entry.path)
                 is WalEntry.Delete -> deleteInternal(entry.path)
                 is WalEntry.Write -> writeInternal(entry.path, entry.offset, entry.data)
-                is WalEntry.SetPermissions -> setPermissionsInternal(entry.path, entry.permissions.toFsPermissions())
+                is WalEntry.SetPermissions -> setPermissionsInternal(
+                    entry.path,
+                    entry.permissions.toFsPermissions()
+                )
             }
         }
     }
@@ -207,6 +234,7 @@ internal class VfsTree {
             permissions = SnapshotPermissions.from(node.permissions),
             children = node.children.values.map { snapshotFromNode(it) }
         )
+
         is FileNode -> SnapshotNode(
             name = node.name, type = node.type.name,
             createdAtMillis = node.createdAtMillis, modifiedAtMillis = node.modifiedAtMillis,
@@ -233,8 +261,14 @@ internal class VfsTree {
                 file
             }
         }
+
         val built = build(snapshot)
-        return if (built is DirNode) built else DirNode("/", nowMillis(), nowMillis(), FsPermissions.FULL)
+        return if (built is DirNode) built else DirNode(
+            "/",
+            nowMillis(),
+            nowMillis(),
+            FsPermissions.FULL
+        )
     }
 
     private fun createFileInternal(path: String) {

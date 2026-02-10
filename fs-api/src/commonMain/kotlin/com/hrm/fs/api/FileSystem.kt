@@ -18,6 +18,7 @@ enum class FsErrorCode {
     PERMISSION_DENIED,
     INVALID_PATH,
     NOT_MOUNTED,
+    LOCKED,
     UNKNOWN
 }
 
@@ -75,11 +76,46 @@ data class FsEvent(
     val kind: FsEventKind
 )
 
+// ─── 文件锁 ────────────────────────────────────────────────
+
+/**
+ * 文件锁类型（类 POSIX flock 语义）。
+ *
+ * - [SHARED]：共享锁（读锁），允许多个持有者并存，阻止独占锁。
+ * - [EXCLUSIVE]：独占锁（写锁），同一时刻只能有一个持有者。
+ */
+enum class FileLockType { SHARED, EXCLUSIVE }
+
 // ─── 句柄 ────────────────────────────────────────────────────
 
 interface FileHandle {
     suspend fun readAt(offset: Long, length: Int): Result<ByteArray>
     suspend fun writeAt(offset: Long, data: ByteArray): Result<Unit>
+
+    /**
+     * 对文件加锁。如果锁不可用，会挂起直到获取成功。
+     *
+     * - [FileLockType.SHARED]：可与其他共享锁并存，但与独占锁互斥。
+     * - [FileLockType.EXCLUSIVE]：与任何其他锁互斥。
+     *
+     * 同一个 [FileHandle] 重复调用 lock 会先释放旧锁再加新锁。
+     */
+    suspend fun lock(type: FileLockType = FileLockType.EXCLUSIVE): Result<Unit>
+
+    /**
+     * 尝试对文件加锁。如果锁不可用，立即返回失败（[FsError.Locked]）。
+     */
+    suspend fun tryLock(type: FileLockType = FileLockType.EXCLUSIVE): Result<Unit>
+
+    /**
+     * 释放当前句柄持有的文件锁。
+     * 如果未持有锁，返回成功（幂等）。
+     */
+    suspend fun unlock(): Result<Unit>
+
+    /**
+     * 关闭句柄，自动释放持有的文件锁。
+     */
     suspend fun close(): Result<Unit>
 }
 
@@ -199,6 +235,18 @@ interface FileSystem {
      * @param dataFlow 数据流
      */
     suspend fun writeStream(path: String, dataFlow: Flow<ByteArray>): Result<Unit>
+
+    // ─── 可观测性 ─────────────────────────────────────────────
+
+    /**
+     * 获取当前文件系统的统计指标快照。
+     */
+    fun metrics(): FsMetrics
+
+    /**
+     * 重置所有统计指标。
+     */
+    fun resetMetrics()
 }
 
 /**
@@ -267,6 +315,53 @@ interface DiskFileWatcher {
     fun stopWatching()
 }
 
+// ─── 可观测性指标 ──────────────────────────────────────────
+
+/**
+ * 单个操作类型的统计指标。
+ */
+data class OpMetrics(
+    /** 调用次数。 */
+    val count: Long = 0,
+    /** 成功次数。 */
+    val successCount: Long = 0,
+    /** 失败次数。 */
+    val failureCount: Long = 0,
+    /** 累计耗时（毫秒）。 */
+    val totalTimeMs: Long = 0,
+    /** 最大耗时（毫秒）。 */
+    val maxTimeMs: Long = 0
+) {
+    /** 平均耗时（毫秒），若无调用则为 0。 */
+    val avgTimeMs: Double get() = if (count > 0) totalTimeMs.toDouble() / count else 0.0
+}
+
+/**
+ * 文件系统全局统计指标快照。
+ *
+ * 每个字段对应一种操作类型的 [OpMetrics]。
+ */
+data class FsMetrics(
+    val createFile: OpMetrics = OpMetrics(),
+    val createDir: OpMetrics = OpMetrics(),
+    val delete: OpMetrics = OpMetrics(),
+    val readDir: OpMetrics = OpMetrics(),
+    val stat: OpMetrics = OpMetrics(),
+    val open: OpMetrics = OpMetrics(),
+    val readAll: OpMetrics = OpMetrics(),
+    val writeAll: OpMetrics = OpMetrics(),
+    val copy: OpMetrics = OpMetrics(),
+    val move: OpMetrics = OpMetrics(),
+    val mount: OpMetrics = OpMetrics(),
+    val unmount: OpMetrics = OpMetrics(),
+    val sync: OpMetrics = OpMetrics(),
+    val setPermissions: OpMetrics = OpMetrics(),
+    /** 总读取字节数。 */
+    val totalBytesRead: Long = 0,
+    /** 总写入字节数。 */
+    val totalBytesWritten: Long = 0
+)
+
 interface FsStorage {
     suspend fun read(key: String): Result<ByteArray?>
     suspend fun write(key: String, data: ByteArray): Result<Unit>
@@ -297,5 +392,6 @@ sealed class FsError(message: String, val code: FsErrorCode) : Exception(message
     class PermissionDenied(path: String) : FsError("无权限: $path", FsErrorCode.PERMISSION_DENIED)
     class InvalidPath(path: String) : FsError("非法路径: $path", FsErrorCode.INVALID_PATH)
     class NotMounted(path: String) : FsError("未挂载: $path", FsErrorCode.NOT_MOUNTED)
+    class Locked(path: String) : FsError("文件已被锁定: $path", FsErrorCode.LOCKED)
     class Unknown(message: String) : FsError(message, FsErrorCode.UNKNOWN)
 }

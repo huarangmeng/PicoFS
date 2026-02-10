@@ -55,7 +55,7 @@
   - **✅ 抽象存储接口**（`FsStorage`）
   - **✅ 内存存储实现**（`InMemoryFsStorage`）
   - **✅ 映射真实目录**（Android/iOS/JVM）
-  - **⬜ 平台持久化 FsStorage 实现**（Android SharedPreferences/文件、iOS UserDefaults/文件、JVM 文件）
+  - **✅ 平台持久化 FsStorage 实现**（JVM/Android 基于 `java.io.File`、iOS 基于 `NSFileManager`，原子写入）
 - **外部变更感知**
   - **✅ DiskFileWatcher 接口**（可选实现，mount 时自动桥接）
   - **✅ JVM WatchService 实现**（`java.nio.file.WatchService` 递归监听）
@@ -64,14 +64,14 @@
   - **✅ 手动同步 `sync()`**（降级场景全量扫描）
 - **事件系统**
   - **✅ 文件变更事件**（`watch()` 返回 `Flow<FsEvent>`，CREATED/MODIFIED/DELETED）
-  - **⬜ IO 统计与可观测性**（操作计数、耗时统计、缓存命中率、metrics 导出接口）
+  - **✅ IO 统计与可观测性**（操作计数、成功/失败数、耗时统计、字节吞吐、`metrics()`/`resetMetrics()` API）
 - **性能与扩展**
-  - **⬜ 缓存策略**（热目录/元数据缓存、读写缓冲、LRU/LFU 淘汰）
+  - **✅ 缓存策略**（挂载点 stat/readDir 结果 LRU 缓存，自动失效）
   - **⬜ 大文件分块**（Block/Page 存储，避免单一 ByteArray 占用连续大内存）
   - **⬜ 磁盘空间配额**（虚拟磁盘容量限制）
 - **高级功能**
   - **⬜ 符号链接**（symlink / hardlink）
-  - **⬜ 文件锁**（flock，文件级并发控制）
+  - **✅ 文件锁**（flock，文件级并发控制，共享锁/独占锁/锁升级/挂起等待）
   - **⬜ 搜索 / 查找**（按文件名/内容搜索，类 find/grep）
   - **⬜ 文件扩展属性**（xattr / 自定义标签）
   - **⬜ 压缩 / 解压**（zip/tar 归档操作）
@@ -120,6 +120,10 @@ interface FileSystem {
     // 流式读写
     fun readStream(path: String, chunkSize: Int = 8192): Flow<ByteArray>
     suspend fun writeStream(path: String, dataFlow: Flow<ByteArray>): Result<Unit>
+
+    // 可观测性
+    fun metrics(): FsMetrics
+    fun resetMetrics()
 }
 ```
 
