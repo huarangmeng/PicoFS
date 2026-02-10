@@ -27,32 +27,63 @@
 
 - **基础能力**
   - **✅ 路径规范化**（`/a/../b`、重复斜杠）
-  - **✅ 目录/文件创建与删除**
+  - **✅ 目录/文件创建与删除**（含递归 `mkdir -p` / `rm -rf`）
   - **✅ 随机读写**（`readAt`/`writeAt`）
-  - **✅ 元数据查询**（大小、时间戳）
+  - **✅ 便捷读写**（`readAll`/`writeAll` 一次性读写）
+  - **✅ 元数据查询**（大小、时间戳、权限）
   - **✅ 目录列举**
+  - **✅ copy / move / rename**（支持跨挂载点）
+- **流式 IO**
+  - **✅ 流式读取**（`readStream` 分块 `Flow<ByteArray>`）
+  - **✅ 流式写入**（`writeStream` 从 `Flow` 逐块写入）
+- **挂载系统**
+  - **✅ 虚拟路径挂载到磁盘目录**（`mount`/`unmount`/`listMounts`）
+  - **✅ 只读挂载**（`MountOptions(readOnly = true)`）
+  - **✅ 挂载持久化与恢复**（`pendingMounts` 机制）
+  - **✅ 三端磁盘操作实现**（Android/iOS/JVM `DiskFileOperations`）
 - **权限与错误模型**
   - **✅ 权限模型**（读/写/执行）
-  - **✅ 统一错误码**（NotFound/PermissionDenied 等）
+  - **✅ 统一错误码**（NotFound/AlreadyExists/PermissionDenied/NotMounted 等 8 种）
   - **⬜ 多用户/角色权限**（ACL/Owner/Group）
 - **一致性与恢复**
-  - **✅ WAL（写前日志）**
-  - **✅ 快照（Snapshot）**
-  - **⚠️ 崩溃恢复验证**（需平台存储适配）
+  - **✅ WAL（写前日志）**（5 种操作类型，自动回放）
+  - **✅ 快照（Snapshot）**（自动快照，每 20 次操作触发）
+  - **⚠️ 崩溃恢复验证**（需平台存储适配 + 断电场景测试）
+  - **⬜ WAL 原子写入保证**（当前 JSON 序列化非原子）
+  - **⬜ 损坏 WAL/Snapshot 容错处理**
 - **持久化存储**
   - **✅ 抽象存储接口**（`FsStorage`）
+  - **✅ 内存存储实现**（`InMemoryFsStorage`）
   - **✅ 映射真实目录**（Android/iOS/JVM）
-  - **⚠️ 外部变更感知**（依赖重新读取目录/刷新）
-- **可观测性**
-  - **⬜ 事件总线/统计**（IO 次数、耗时、命中率）
+  - **⬜ 平台持久化 FsStorage 实现**（Android SharedPreferences/文件、iOS UserDefaults/文件、JVM 文件）
+- **外部变更感知**
+  - **✅ DiskFileWatcher 接口**（可选实现，mount 时自动桥接）
+  - **✅ JVM WatchService 实现**（`java.nio.file.WatchService` 递归监听）
+  - **✅ Android 分版本实现**（API 26+ WatchService / API 24-25 轮询）
+  - **✅ iOS 轮询实现**（`NSFileManager` 快照对比）
+  - **✅ 手动同步 `sync()`**（降级场景全量扫描）
+- **事件系统**
+  - **✅ 文件变更事件**（`watch()` 返回 `Flow<FsEvent>`，CREATED/MODIFIED/DELETED）
+  - **⬜ IO 统计与可观测性**（操作计数、耗时统计、缓存命中率、metrics 导出接口）
 - **性能与扩展**
-  - **⬜ 缓存策略**（热目录缓存、读写缓冲）
-  - **⬜ 大文件分块**（Block/Page）
+  - **⬜ 缓存策略**（热目录/元数据缓存、读写缓冲、LRU/LFU 淘汰）
+  - **⬜ 大文件分块**（Block/Page 存储，避免单一 ByteArray 占用连续大内存）
+  - **⬜ 磁盘空间配额**（虚拟磁盘容量限制）
+- **高级功能**
+  - **⬜ 符号链接**（symlink / hardlink）
+  - **⬜ 文件锁**（flock，文件级并发控制）
+  - **⬜ 搜索 / 查找**（按文件名/内容搜索，类 find/grep）
+  - **⬜ 文件扩展属性**（xattr / 自定义标签）
+  - **⬜ 压缩 / 解压**（zip/tar 归档操作）
+  - **⬜ 文件哈希 / 校验**（MD5/SHA 完整性校验）
+  - **⬜ 回收站**（软删除 + 恢复机制）
+  - **⬜ 版本历史**（文件版本追踪 / diff）
 
-### 最小接口（示意）
+### 当前接口概览
 
 ```kotlin
 interface FileSystem {
+    // 基础 CRUD
     suspend fun createFile(path: String): Result<Unit>
     suspend fun createDir(path: String): Result<Unit>
     suspend fun open(path: String, mode: OpenMode): Result<FileHandle>
@@ -60,6 +91,35 @@ interface FileSystem {
     suspend fun stat(path: String): Result<FsMeta>
     suspend fun delete(path: String): Result<Unit>
     suspend fun setPermissions(path: String, permissions: FsPermissions): Result<Unit>
+
+    // 递归操作
+    suspend fun createDirRecursive(path: String): Result<Unit>
+    suspend fun deleteRecursive(path: String): Result<Unit>
+
+    // 便捷读写
+    suspend fun readAll(path: String): Result<ByteArray>
+    suspend fun writeAll(path: String, data: ByteArray): Result<Unit>
+
+    // copy / move / rename
+    suspend fun copy(srcPath: String, dstPath: String): Result<Unit>
+    suspend fun move(srcPath: String, dstPath: String): Result<Unit>
+    suspend fun rename(srcPath: String, dstPath: String): Result<Unit>
+
+    // 挂载
+    suspend fun mount(virtualPath: String, diskOps: DiskFileOperations, options: MountOptions = MountOptions()): Result<Unit>
+    suspend fun unmount(virtualPath: String): Result<Unit>
+    suspend fun listMounts(): List<String>
+    suspend fun pendingMounts(): List<PendingMount>
+
+    // 同步
+    suspend fun sync(path: String): Result<List<FsEvent>>
+
+    // 监听
+    fun watch(path: String): Flow<FsEvent>
+
+    // 流式读写
+    fun readStream(path: String, chunkSize: Int = 8192): Flow<ByteArray>
+    suspend fun writeStream(path: String, dataFlow: Flow<ByteArray>): Result<Unit>
 }
 ```
 
@@ -76,7 +136,7 @@ interface FileSystem {
 - **目的**：VFS 操作直接落盘到应用根目录，`readDir`/`stat` 能感知到外部新增文件。
 - **实现**：由 `fs-core` 提供统一入口 `createFileSystem(FsConfig)`，通过参数选择 **虚拟** 或 **真实** 文件系统。
 - **Android 初始化**：在 `App(backend = FsBackend.REAL, rootPath = filesDir.absolutePath)` 传入根目录。
-- **外部变更感知**：当应用目录被外部写入后，调用 `readDir`/`stat` 将读取最新文件状态。
+- **外部变更感知**：平台层 `DiskFileOperations` 可选实现 `DiskFileWatcher` 接口，mount 时自动桥接磁盘变更到 VFS 事件流；也可调用 `sync()` 手动全量同步。
 
 ### 项目结构建议
 

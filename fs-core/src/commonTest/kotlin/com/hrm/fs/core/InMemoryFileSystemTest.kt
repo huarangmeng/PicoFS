@@ -1,10 +1,16 @@
 package com.hrm.fs.core
 
 import com.hrm.fs.api.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.runTest
 import kotlin.test.*
 
@@ -627,6 +633,90 @@ class InMemoryFileSystemTest {
         assertTrue(result.isFailure)
         assertIs<FsError.NotFile>(result.exceptionOrNull())
     }
+
+    // ═════════════════════════════════════════════════════════════
+    // 外部文件变更感知
+    // ═════════════════════════════════════════════════════════════
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun disk_watcher_bridge_emits_vfs_events() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val watchScope = CoroutineScope(SupervisorJob() + dispatcher)
+        val fs = InMemoryFileSystem(watcherScope = watchScope)
+        val diskOps = FakeWatchableDiskOps()
+        fs.mount("/ext", diskOps).getOrThrow()
+
+        val events = mutableListOf<FsEvent>()
+        val collector = launch(dispatcher) {
+            fs.watch("/ext").collect { events.add(it) }
+        }
+
+        diskOps.externalEvents.tryEmit(DiskFileEvent("/newfile.txt", FsEventKind.CREATED))
+        diskOps.externalEvents.tryEmit(DiskFileEvent("/newfile.txt", FsEventKind.MODIFIED))
+        diskOps.externalEvents.tryEmit(DiskFileEvent("/newfile.txt", FsEventKind.DELETED))
+
+        assertEquals(3, events.size)
+        assertEquals(FsEvent("/ext/newfile.txt", FsEventKind.CREATED), events[0])
+        assertEquals(FsEvent("/ext/newfile.txt", FsEventKind.MODIFIED), events[1])
+        assertEquals(FsEvent("/ext/newfile.txt", FsEventKind.DELETED), events[2])
+
+        collector.cancel()
+        watchScope.cancel()
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    @Test
+    fun disk_watcher_stops_on_unmount() = runTest {
+        val dispatcher = UnconfinedTestDispatcher(testScheduler)
+        val watchScope = CoroutineScope(SupervisorJob() + dispatcher)
+        val fs = InMemoryFileSystem(watcherScope = watchScope)
+        val diskOps = FakeWatchableDiskOps()
+        fs.mount("/ext", diskOps).getOrThrow()
+
+        val events = mutableListOf<FsEvent>()
+        val collector = launch(dispatcher) {
+            fs.watch("/ext").collect { events.add(it) }
+        }
+
+        // 卸载后事件应不再转发
+        fs.unmount("/ext").getOrThrow()
+
+        diskOps.externalEvents.tryEmit(DiskFileEvent("/after.txt", FsEventKind.CREATED))
+
+        // unmount 后的磁盘事件不应出现在 VFS 事件流中
+        assertTrue(events.none { it.path == "/ext/after.txt" })
+
+        collector.cancel()
+        watchScope.cancel()
+    }
+
+    @Test
+    fun sync_on_non_mount_path_fails() = runTest {
+        val fs = createFs()
+        fs.createDir("/local").getOrThrow()
+
+        val result = fs.sync("/local")
+        assertTrue(result.isFailure)
+        assertIs<FsError.NotMounted>(result.exceptionOrNull())
+    }
+
+    @Test
+    fun sync_returns_events_for_mounted_path() = runTest {
+        val fs = createFs()
+        val diskOps = FakeDiskFileOperations()
+        fs.mount("/mnt", diskOps).getOrThrow()
+
+        // 模拟外部直接在磁盘添加文件
+        diskOps.files["/a.txt"] = "hello".encodeToByteArray()
+        diskOps.files["/b.txt"] = "world".encodeToByteArray()
+
+        val events = fs.sync("/mnt").getOrThrow()
+        assertTrue(events.isNotEmpty())
+        val paths = events.map { it.path }.toSet()
+        assertTrue("/mnt/a.txt" in paths)
+        assertTrue("/mnt/b.txt" in paths)
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════
@@ -678,6 +768,98 @@ private class FakeDiskFileOperations : DiskFileOperations {
         dirs.remove(path)
         createdFiles.remove(path)
         createdDirs.remove(path)
+        return Result.success(Unit)
+    }
+
+    override suspend fun list(path: String): Result<List<FsEntry>> {
+        val prefix = if (path == "/") "/" else "$path/"
+        val entries = mutableListOf<FsEntry>()
+        for (f in files.keys) {
+            if (f.startsWith(prefix) && f.removePrefix(prefix).count { it == '/' } == 0) {
+                entries.add(FsEntry(f.substringAfterLast('/'), FsType.FILE))
+            }
+        }
+        for (d in dirs) {
+            if (d != path && d.startsWith(prefix) && d.removePrefix(prefix).count { it == '/' } == 0) {
+                entries.add(FsEntry(d.substringAfterLast('/'), FsType.DIRECTORY))
+            }
+        }
+        return Result.success(entries)
+    }
+
+    override suspend fun stat(path: String): Result<FsMeta> {
+        if (files.containsKey(path)) {
+            return Result.success(
+                FsMeta(
+                    path = path, type = FsType.FILE, size = files[path]!!.size.toLong(),
+                    createdAtMillis = 0, modifiedAtMillis = 0, permissions = FsPermissions.FULL
+                )
+            )
+        }
+        if (dirs.contains(path)) {
+            return Result.success(
+                FsMeta(
+                    path = path, type = FsType.DIRECTORY, size = 0,
+                    createdAtMillis = 0, modifiedAtMillis = 0, permissions = FsPermissions.FULL
+                )
+            )
+        }
+        return Result.failure(FsError.NotFound(path))
+    }
+
+    override suspend fun exists(path: String): Boolean = files.containsKey(path) || dirs.contains(path)
+}
+
+// ═════════════════════════════════════════════════════════════════
+// Fake DiskFileOperations + DiskFileWatcher for testing external change detection
+// ═════════════════════════════════════════════════════════════════
+
+private class FakeWatchableDiskOps : DiskFileOperations, DiskFileWatcher {
+    override val rootPath: String = "/watchable"
+
+    val files = mutableMapOf<String, ByteArray>()
+    val dirs = mutableSetOf<String>("/")
+
+    /** 外部通过此 flow 模拟磁盘变更事件。 */
+    val externalEvents = MutableSharedFlow<DiskFileEvent>(extraBufferCapacity = 64)
+
+    override fun watchDisk(scope: CoroutineScope): Flow<DiskFileEvent> = externalEvents
+
+    override fun stopWatching() {}
+
+    override suspend fun createFile(path: String): Result<Unit> {
+        files[path] = ByteArray(0)
+        return Result.success(Unit)
+    }
+
+    override suspend fun createDir(path: String): Result<Unit> {
+        dirs.add(path)
+        return Result.success(Unit)
+    }
+
+    override suspend fun readFile(path: String, offset: Long, length: Int): Result<ByteArray> {
+        val data = files[path] ?: return Result.failure(FsError.NotFound(path))
+        if (offset >= data.size) return Result.success(ByteArray(0))
+        val end = minOf(offset.toInt() + length, data.size)
+        return Result.success(data.copyOfRange(offset.toInt(), end))
+    }
+
+    override suspend fun writeFile(path: String, offset: Long, data: ByteArray): Result<Unit> {
+        val existing = files[path] ?: ByteArray(0)
+        val end = offset.toInt() + data.size
+        val newData = if (end > existing.size) {
+            ByteArray(end).also { existing.copyInto(it) }
+        } else {
+            existing.copyOf()
+        }
+        data.copyInto(newData, destinationOffset = offset.toInt())
+        files[path] = newData
+        return Result.success(Unit)
+    }
+
+    override suspend fun delete(path: String): Result<Unit> {
+        files.remove(path)
+        dirs.remove(path)
         return Result.success(Unit)
     }
 

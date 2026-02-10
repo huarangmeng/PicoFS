@@ -1,24 +1,47 @@
 package com.hrm.fs.platform
 
+import com.hrm.fs.api.DiskFileEvent
 import com.hrm.fs.api.DiskFileOperations
+import com.hrm.fs.api.DiskFileWatcher
 import com.hrm.fs.api.FsEntry
 import com.hrm.fs.api.FsError
+import com.hrm.fs.api.FsEventKind
 import com.hrm.fs.api.FsMeta
 import com.hrm.fs.api.FsPermissions
 import com.hrm.fs.api.FsType
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.RandomAccessFile
+import java.nio.file.FileSystems
+import java.nio.file.FileVisitResult
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.StandardWatchEventKinds
+import java.nio.file.WatchKey
+import java.nio.file.WatchService
+import java.nio.file.attribute.BasicFileAttributes
+import java.util.concurrent.TimeUnit
 
 actual fun createDiskFileOperations(rootPath: String): DiskFileOperations = JvmDiskFileOperations(rootPath)
 
-internal class JvmDiskFileOperations(override val rootPath: String) : DiskFileOperations {
+internal class JvmDiskFileOperations(override val rootPath: String) : DiskFileOperations, DiskFileWatcher {
 
     private fun resolve(path: String): File {
         val rel = path.removePrefix("/")
         return if (rel.isEmpty()) File(rootPath) else File(rootPath, rel)
     }
+
+    // ═══════════════════════════════════════════════════════════
+    // DiskFileOperations
+    // ═══════════════════════════════════════════════════════════
 
     override suspend fun createFile(path: String): Result<Unit> = withContext(Dispatchers.IO) {
         runCatching {
@@ -116,5 +139,93 @@ internal class JvmDiskFileOperations(override val rootPath: String) : DiskFileOp
 
     override suspend fun exists(path: String): Boolean = withContext(Dispatchers.IO) {
         resolve(path).exists()
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // DiskFileWatcher — 基于 java.nio.file.WatchService
+    // ═══════════════════════════════════════════════════════════
+
+    @Volatile
+    private var watchService: WatchService? = null
+
+    override fun watchDisk(scope: CoroutineScope): Flow<DiskFileEvent> = callbackFlow {
+        val root = File(rootPath).toPath()
+        if (!Files.isDirectory(root)) {
+            close()
+            return@callbackFlow
+        }
+
+        val ws = FileSystems.getDefault().newWatchService()
+        watchService = ws
+
+        val keyToPath = HashMap<WatchKey, Path>()
+
+        fun registerDir(dir: Path) {
+            try {
+                val key = dir.register(
+                    ws,
+                    StandardWatchEventKinds.ENTRY_CREATE,
+                    StandardWatchEventKinds.ENTRY_MODIFY,
+                    StandardWatchEventKinds.ENTRY_DELETE
+                )
+                keyToPath[key] = dir
+            } catch (_: Exception) {
+                // 目录可能已被删除或无权限，忽略
+            }
+        }
+
+        // 递归注册已有的所有目录
+        Files.walkFileTree(root, object : SimpleFileVisitor<Path>() {
+            override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
+                registerDir(dir)
+                return FileVisitResult.CONTINUE
+            }
+        })
+
+        // 在后台协程中轮询事件
+        val pollJob = scope.launch(Dispatchers.IO) {
+            while (isActive) {
+                val key = ws.poll(500, TimeUnit.MILLISECONDS) ?: continue
+                val dir = keyToPath[key] ?: continue
+
+                for (event in key.pollEvents()) {
+                    val kind = event.kind()
+                    if (kind == StandardWatchEventKinds.OVERFLOW) continue
+
+                    @Suppress("UNCHECKED_CAST")
+                    val changedPath = dir.resolve(event.context() as Path)
+                    val relativePath = "/" + root.relativize(changedPath).toString().replace('\\', '/')
+
+                    val fsKind = when (kind) {
+                        StandardWatchEventKinds.ENTRY_CREATE -> FsEventKind.CREATED
+                        StandardWatchEventKinds.ENTRY_MODIFY -> FsEventKind.MODIFIED
+                        StandardWatchEventKinds.ENTRY_DELETE -> FsEventKind.DELETED
+                        else -> continue
+                    }
+
+                    trySend(DiskFileEvent(relativePath, fsKind))
+
+                    // 新建目录时自动注册监听
+                    if (fsKind == FsEventKind.CREATED && Files.isDirectory(changedPath)) {
+                        registerDir(changedPath)
+                    }
+                }
+
+                if (!key.reset()) {
+                    keyToPath.remove(key)
+                }
+            }
+        }
+
+        awaitClose {
+            pollJob.cancel()
+            ws.close()
+            watchService = null
+        }
+    }
+
+    override fun stopWatching() {
+        watchService?.close()
+        watchService = null
     }
 }

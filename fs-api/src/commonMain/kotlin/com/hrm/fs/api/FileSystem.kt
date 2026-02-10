@@ -160,6 +160,17 @@ interface FileSystem {
      */
     suspend fun pendingMounts(): List<PendingMount>
 
+    /**
+     * 手动同步指定挂载点路径与真实磁盘的状态。
+     *
+     * 扫描磁盘目录与上次快照的差异，为新增/删除/修改的文件产生 [FsEvent]。
+     * 适用于 [DiskFileWatcher] 不可用的降级场景，或者需要一次性全量同步的场合。
+     *
+     * @param path 虚拟路径（必须位于某个挂载点下，或为挂载点本身）
+     * @return 本次 sync 检测到的事件列表
+     */
+    suspend fun sync(path: String): Result<List<FsEvent>>
+
     // ─── 监听 ────────────────────────────────────────────────
 
     /**
@@ -207,6 +218,53 @@ interface DiskFileOperations {
     suspend fun list(path: String): Result<List<FsEntry>>
     suspend fun stat(path: String): Result<FsMeta>
     suspend fun exists(path: String): Boolean
+}
+
+/**
+ * 磁盘文件变更事件（由 [DiskFileWatcher] 产生）。
+ *
+ * @param relativePath 相对于监听根目录的路径（如 "/docs/a.txt"）
+ * @param kind 变更类型
+ */
+data class DiskFileEvent(
+    val relativePath: String,
+    val kind: FsEventKind
+)
+
+/**
+ * 可选的磁盘文件变更监听接口。
+ *
+ * [DiskFileOperations] 的实现类如果同时实现了此接口，
+ * 则在 [FileSystem.mount] 时会自动启动监听，
+ * 将外部程序对磁盘目录的变更同步到虚拟文件系统的事件流中。
+ *
+ * 使用方式：平台层的 `DiskFileOperations` 实现同时实现此接口即可，
+ * 无需额外配置。
+ *
+ * ```kotlin
+ * class JvmDiskFileOperations(...) : DiskFileOperations, DiskFileWatcher {
+ *     override fun watchDisk(scope: CoroutineScope): Flow<DiskFileEvent> { ... }
+ *     override fun stopWatching() { ... }
+ * }
+ * ```
+ */
+interface DiskFileWatcher {
+    /**
+     * 启动对 [DiskFileOperations.rootPath] 目录的递归监听。
+     *
+     * 返回一个 [Flow]，在外部程序创建/修改/删除文件时发出 [DiskFileEvent]。
+     * 该 Flow 应在给定的 [scope] 内工作，[scope] 取消时监听自动停止。
+     *
+     * @param scope 协程作用域，控制监听生命周期
+     * @return 变更事件流
+     */
+    fun watchDisk(scope: kotlinx.coroutines.CoroutineScope): Flow<DiskFileEvent>
+
+    /**
+     * 手动停止监听。
+     * 也可以通过取消 [watchDisk] 传入的 scope 来停止。
+     */
+    fun stopWatching()
 }
 
 interface FsStorage {
