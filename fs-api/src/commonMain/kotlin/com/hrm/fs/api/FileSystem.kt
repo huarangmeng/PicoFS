@@ -19,6 +19,7 @@ enum class FsErrorCode {
     INVALID_PATH,
     NOT_MOUNTED,
     LOCKED,
+    QUOTA_EXCEEDED,
     UNKNOWN
 }
 
@@ -247,6 +248,62 @@ interface FileSystem {
      * 重置所有统计指标。
      */
     fun resetMetrics()
+
+    // ─── 配额 ────────────────────────────────────────────────
+
+    /**
+     * 获取当前虚拟文件系统的空间配额信息。
+     * 仅统计内存文件树的使用量（挂载点使用真实磁盘，不计入配额）。
+     */
+    fun quotaInfo(): QuotaInfo
+
+    // ─── 文件哈希 / 校验 ─────────────────────────────────────────
+
+    /**
+     * 计算文件的校验值。
+     *
+     * 支持内存文件和挂载点文件。对于大文件会读取全部内容后计算。
+     *
+     * @param path 虚拟路径
+     * @param algorithm 校验算法（默认 SHA-256）
+     * @return 十六进制小写字符串
+     */
+    suspend fun checksum(
+        path: String,
+        algorithm: ChecksumAlgorithm = ChecksumAlgorithm.SHA256
+    ): Result<String>
+
+    // ─── 版本历史 ───────────────────────────────────────────────
+
+    /**
+     * 获取文件的版本历史列表（最新在前）。
+     *
+     * 仅支持内存文件（挂载点文件返回空列表）。
+     * 每次通过 [FileHandle.writeAt]、[writeAll]、[writeStream] 写入时自动保存历史版本。
+     *
+     * @param path 虚拟路径
+     * @return 版本列表
+     */
+    suspend fun fileVersions(path: String): Result<List<FileVersion>>
+
+    /**
+     * 读取文件的某个历史版本内容。
+     *
+     * @param path 虚拟路径
+     * @param versionId 版本 ID（从 [fileVersions] 获取）
+     * @return 该版本的文件内容
+     */
+    suspend fun readVersion(path: String, versionId: String): Result<ByteArray>
+
+    /**
+     * 恢复文件到某个历史版本。
+     *
+     * 将指定版本的内容写回文件（同时当前内容也会作为新版本保存）。
+     *
+     * @param path 虚拟路径
+     * @param versionId 要恢复到的版本 ID
+     */
+    suspend fun restoreVersion(path: String, versionId: String): Result<Unit>
 }
 
 /**
@@ -362,6 +419,51 @@ data class FsMetrics(
     val totalBytesWritten: Long = 0
 )
 
+/**
+ * 虚拟文件系统的空间配额信息。
+ *
+ * @param quotaBytes 配额上限（字节），-1 表示无限制
+ * @param usedBytes 当前已使用字节数（内存文件树）
+ */
+data class QuotaInfo(
+    val quotaBytes: Long,
+    val usedBytes: Long
+) {
+    /** 剩余可用字节数，无限制时返回 [Long.MAX_VALUE]。 */
+    val availableBytes: Long
+        get() = if (quotaBytes < 0) Long.MAX_VALUE else maxOf(0, quotaBytes - usedBytes)
+
+    /** 是否启用了配额限制。 */
+    val hasQuota: Boolean get() = quotaBytes >= 0
+}
+
+// ─── 校验算法 ────────────────────────────────────────────────
+
+/**
+ * 支持的文件校验算法。
+ */
+enum class ChecksumAlgorithm {
+    /** CRC32 校验码（8 位十六进制）。 */
+    CRC32,
+    /** SHA-256 哈希（64 位十六进制）。 */
+    SHA256
+}
+
+// ─── 文件版本 ────────────────────────────────────────────────
+
+/**
+ * 文件历史版本的元数据。
+ *
+ * @param versionId 版本唯一标识符
+ * @param timestampMillis 版本保存时间戳（毫秒）
+ * @param size 该版本的文件大小（字节）
+ */
+data class FileVersion(
+    val versionId: String,
+    val timestampMillis: Long,
+    val size: Long
+)
+
 interface FsStorage {
     suspend fun read(key: String): Result<ByteArray?>
     suspend fun write(key: String, data: ByteArray): Result<Unit>
@@ -393,5 +495,6 @@ sealed class FsError(message: String, val code: FsErrorCode) : Exception(message
     class InvalidPath(path: String) : FsError("非法路径: $path", FsErrorCode.INVALID_PATH)
     class NotMounted(path: String) : FsError("未挂载: $path", FsErrorCode.NOT_MOUNTED)
     class Locked(path: String) : FsError("文件已被锁定: $path", FsErrorCode.LOCKED)
+    class QuotaExceeded(message: String) : FsError(message, FsErrorCode.QUOTA_EXCEEDED)
     class Unknown(message: String) : FsError(message, FsErrorCode.UNKNOWN)
 }

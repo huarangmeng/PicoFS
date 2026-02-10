@@ -19,6 +19,9 @@ class InMemoryFileSystemTest {
     private fun createFs(storage: FsStorage? = null): FileSystem =
         InMemoryFileSystem(storage = storage)
 
+    private fun createFsWithQuota(quotaBytes: Long, storage: FsStorage? = null): FileSystem =
+        InMemoryFileSystem(storage = storage, quotaBytes = quotaBytes)
+
     // ═════════════════════════════════════════════════════════════
     // PathUtils
     // ═════════════════════════════════════════════════════════════
@@ -1097,6 +1100,375 @@ class InMemoryFileSystemTest {
         // 应该返回更新后的数据（非旧缓存）
         val meta = fs.stat("/mnt/f.txt").getOrThrow()
         assertEquals("updated-data".length.toLong(), meta.size)
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 大文件分块存储
+    // ═══════════════════════════════════════════════════════════
+
+    @Test
+    fun large_file_write_and_read() = runTest {
+        val fs = createFs()
+        // 写入 200KB 数据（超过默认 64KB block 大小，跨多个 block）
+        val size = 200 * 1024
+        val data = ByteArray(size) { (it % 256).toByte() }
+        fs.writeAll("/big.bin", data).getOrThrow()
+
+        val readBack = fs.readAll("/big.bin").getOrThrow()
+        assertEquals(size, readBack.size)
+        assertTrue(data.contentEquals(readBack))
+    }
+
+    @Test
+    fun large_file_partial_read() = runTest {
+        val fs = createFs()
+        val size = 150 * 1024
+        val data = ByteArray(size) { (it % 256).toByte() }
+        fs.writeAll("/big.bin", data).getOrThrow()
+
+        // 从中间读取跨越 block 边界的数据
+        val handle = fs.open("/big.bin", OpenMode.READ).getOrThrow()
+        val offset = 60 * 1024L  // block 0 的末尾附近
+        val length = 10 * 1024   // 跨越 block 0 → block 1
+        val chunk = handle.readAt(offset, length).getOrThrow()
+        handle.close()
+
+        assertEquals(length, chunk.size)
+        val expected = data.copyOfRange(offset.toInt(), offset.toInt() + length)
+        assertTrue(expected.contentEquals(chunk))
+    }
+
+    @Test
+    fun large_file_overwrite_middle() = runTest {
+        val fs = createFs()
+        val size = 128 * 1024
+        val data = ByteArray(size) { 0 }
+        fs.writeAll("/f.bin", data).getOrThrow()
+
+        // 在中间写入一段数据
+        val handle = fs.open("/f.bin", OpenMode.WRITE).getOrThrow()
+        val patch = ByteArray(1024) { 0xFF.toByte() }
+        handle.writeAt(64 * 1024L - 512, patch).getOrThrow()  // 跨越 block 边界
+        handle.close()
+
+        val readBack = fs.readAll("/f.bin").getOrThrow()
+        assertEquals(size, readBack.size)
+        // 验证 patch 区域
+        for (i in patch.indices) {
+            assertEquals(0xFF.toByte(), readBack[64 * 1024 - 512 + i], "byte at ${64 * 1024 - 512 + i}")
+        }
+        // 验证 patch 前后仍为 0
+        assertEquals(0, readBack[0])
+        assertEquals(0, readBack[size - 1])
+    }
+
+    @Test
+    fun large_file_stream_read() = runTest {
+        val fs = createFs()
+        val size = 200 * 1024
+        val data = ByteArray(size) { (it % 256).toByte() }
+        fs.writeAll("/big.bin", data).getOrThrow()
+
+        // 用 readStream 分块读取
+        val chunks = fs.readStream("/big.bin", chunkSize = 32 * 1024).toList()
+        // 200KB / 32KB = 6.25 → 7 chunks
+        assertEquals(7, chunks.size)
+
+        // 拼回来检查完整性
+        val reassembled = ByteArray(size)
+        var offset = 0
+        for (chunk in chunks) {
+            chunk.copyInto(reassembled, offset)
+            offset += chunk.size
+        }
+        assertEquals(size, offset)
+        assertTrue(data.contentEquals(reassembled))
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 磁盘空间配额
+    // ═══════════════════════════════════════════════════════════
+
+    @Test
+    fun quota_info_no_limit() = runTest {
+        val fs = createFs()
+        val info = fs.quotaInfo()
+        assertFalse(info.hasQuota)
+        assertEquals(-1L, info.quotaBytes)
+        assertEquals(Long.MAX_VALUE, info.availableBytes)
+    }
+
+    @Test
+    fun quota_info_tracks_usage() = runTest {
+        val fs = createFsWithQuota(1024)
+        val info1 = fs.quotaInfo()
+        assertEquals(1024L, info1.quotaBytes)
+        assertEquals(0L, info1.usedBytes)
+        assertEquals(1024L, info1.availableBytes)
+
+        fs.writeAll("/f.txt", ByteArray(100)).getOrThrow()
+        val info2 = fs.quotaInfo()
+        assertEquals(100L, info2.usedBytes)
+        assertEquals(924L, info2.availableBytes)
+    }
+
+    @Test
+    fun quota_blocks_write_when_exceeded() = runTest {
+        val fs = createFsWithQuota(100)
+        fs.writeAll("/f.txt", ByteArray(50)).getOrThrow()
+
+        // 写入 60 字节会使总量达到 110，超出 100 的配额
+        val result = fs.writeAll("/g.txt", ByteArray(60))
+        assertTrue(result.isFailure)
+        assertIs<FsError.QuotaExceeded>(result.exceptionOrNull())
+    }
+
+    @Test
+    fun quota_allows_overwrite_within_limit() = runTest {
+        val fs = createFsWithQuota(100)
+        fs.writeAll("/f.txt", ByteArray(80)).getOrThrow()
+
+        // 覆盖写入，文件大小不变（80 → 80），不应该超出配额
+        fs.writeAll("/f.txt", ByteArray(80)).getOrThrow()
+        assertEquals(80L, fs.quotaInfo().usedBytes)
+    }
+
+    @Test
+    fun quota_freed_on_delete() = runTest {
+        val fs = createFsWithQuota(200)
+        fs.writeAll("/a.txt", ByteArray(100)).getOrThrow()
+        assertEquals(100L, fs.quotaInfo().usedBytes)
+
+        fs.delete("/a.txt").getOrThrow()
+        assertEquals(0L, fs.quotaInfo().usedBytes)
+        assertEquals(200L, fs.quotaInfo().availableBytes)
+
+        // 删除后空间释放，可以写入新文件
+        fs.writeAll("/b.txt", ByteArray(180)).getOrThrow()
+        assertEquals(180L, fs.quotaInfo().usedBytes)
+    }
+
+    @Test
+    fun quota_no_limit_allows_large_write() = runTest {
+        val fs = createFs()  // 无配额限制
+        // 写入较大数据不应报错
+        fs.writeAll("/big.bin", ByteArray(1024 * 1024)).getOrThrow()
+        assertTrue(fs.quotaInfo().usedBytes >= 1024 * 1024)
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 文件哈希 / 校验
+    // ═══════════════════════════════════════════════════════════
+
+    @Test
+    fun checksum_crc32() = runTest {
+        val fs = createFs()
+        val content = "Hello PicoFS"
+        fs.writeAll("/f.txt", content.encodeToByteArray()).getOrThrow()
+
+        val hash = fs.checksum("/f.txt", ChecksumAlgorithm.CRC32).getOrThrow()
+        // CRC32 应返回 8 位十六进制字符串
+        assertEquals(8, hash.length)
+        assertTrue(hash.all { it in '0'..'9' || it in 'a'..'f' })
+    }
+
+    @Test
+    fun checksum_sha256() = runTest {
+        val fs = createFs()
+        val content = "Hello PicoFS"
+        fs.writeAll("/f.txt", content.encodeToByteArray()).getOrThrow()
+
+        val hash = fs.checksum("/f.txt", ChecksumAlgorithm.SHA256).getOrThrow()
+        // SHA-256 应返回 64 位十六进制字符串
+        assertEquals(64, hash.length)
+        assertTrue(hash.all { it in '0'..'9' || it in 'a'..'f' })
+    }
+
+    @Test
+    fun checksum_same_content_same_hash() = runTest {
+        val fs = createFs()
+        val content = "identical content".encodeToByteArray()
+        fs.writeAll("/a.txt", content).getOrThrow()
+        fs.writeAll("/b.txt", content).getOrThrow()
+
+        val hashA = fs.checksum("/a.txt").getOrThrow()
+        val hashB = fs.checksum("/b.txt").getOrThrow()
+        assertEquals(hashA, hashB)
+    }
+
+    @Test
+    fun checksum_different_content_different_hash() = runTest {
+        val fs = createFs()
+        fs.writeAll("/a.txt", "aaa".encodeToByteArray()).getOrThrow()
+        fs.writeAll("/b.txt", "bbb".encodeToByteArray()).getOrThrow()
+
+        val hashA = fs.checksum("/a.txt").getOrThrow()
+        val hashB = fs.checksum("/b.txt").getOrThrow()
+        assertNotEquals(hashA, hashB)
+    }
+
+    @Test
+    fun checksum_empty_file() = runTest {
+        val fs = createFs()
+        fs.createFile("/empty.txt").getOrThrow()
+
+        val hash = fs.checksum("/empty.txt").getOrThrow()
+        assertEquals(64, hash.length) // SHA-256 默认
+    }
+
+    @Test
+    fun checksum_not_found() = runTest {
+        val fs = createFs()
+        val result = fs.checksum("/missing.txt")
+        assertTrue(result.isFailure)
+        assertIs<FsError.NotFound>(result.exceptionOrNull())
+    }
+
+    @Test
+    fun checksum_on_directory_fails() = runTest {
+        val fs = createFs()
+        fs.createDir("/d").getOrThrow()
+        val result = fs.checksum("/d")
+        assertTrue(result.isFailure)
+        assertIs<FsError.NotFile>(result.exceptionOrNull())
+    }
+
+    @Test
+    fun checksum_sha256_known_value() = runTest {
+        // 验证 SHA-256 实现正确性：空字节数组的 SHA-256
+        val fs = createFs()
+        fs.createFile("/empty.txt").getOrThrow()
+        val hash = fs.checksum("/empty.txt", ChecksumAlgorithm.SHA256).getOrThrow()
+        // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        assertEquals("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", hash)
+    }
+
+    @Test
+    fun checksum_crc32_known_value() = runTest {
+        val fs = createFs()
+        fs.createFile("/empty.txt").getOrThrow()
+        val hash = fs.checksum("/empty.txt", ChecksumAlgorithm.CRC32).getOrThrow()
+        // CRC32("") = 00000000
+        assertEquals("00000000", hash)
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 版本历史
+    // ═══════════════════════════════════════════════════════════
+
+    @Test
+    fun version_history_empty_for_new_file() = runTest {
+        val fs = createFs()
+        fs.writeAll("/f.txt", "v1".encodeToByteArray()).getOrThrow()
+        // 第一次写入时文件大小为 0，不会保存空版本
+        val versions = fs.fileVersions("/f.txt").getOrThrow()
+        assertTrue(versions.isEmpty())
+    }
+
+    @Test
+    fun version_history_saved_on_write() = runTest {
+        val fs = createFs()
+        fs.writeAll("/f.txt", "v1".encodeToByteArray()).getOrThrow()
+        fs.writeAll("/f.txt", "version 2".encodeToByteArray()).getOrThrow()
+
+        val versions = fs.fileVersions("/f.txt").getOrThrow()
+        assertEquals(1, versions.size)
+        assertEquals(2L, versions[0].size) // "v1" 是 2 字节
+    }
+
+    @Test
+    fun version_history_multiple_writes() = runTest {
+        val fs = createFs()
+        fs.writeAll("/f.txt", "v1".encodeToByteArray()).getOrThrow()
+        fs.writeAll("/f.txt", "v2".encodeToByteArray()).getOrThrow()
+        fs.writeAll("/f.txt", "v3".encodeToByteArray()).getOrThrow()
+
+        val versions = fs.fileVersions("/f.txt").getOrThrow()
+        // v1→v2 保存一个版本(v1)，v2→v3 保存一个版本(v2)
+        assertEquals(2, versions.size)
+        // 最新在前
+        assertEquals(2L, versions[0].size) // "v2"
+        assertEquals(2L, versions[1].size) // "v1"
+    }
+
+    @Test
+    fun read_version_content() = runTest {
+        val fs = createFs()
+        fs.writeAll("/f.txt", "original".encodeToByteArray()).getOrThrow()
+        fs.writeAll("/f.txt", "modified".encodeToByteArray()).getOrThrow()
+
+        val versions = fs.fileVersions("/f.txt").getOrThrow()
+        assertEquals(1, versions.size)
+
+        val oldContent = fs.readVersion("/f.txt", versions[0].versionId).getOrThrow()
+        assertEquals("original", oldContent.decodeToString())
+    }
+
+    @Test
+    fun restore_version() = runTest {
+        val fs = createFs()
+        fs.writeAll("/f.txt", "v1-content".encodeToByteArray()).getOrThrow()
+        fs.writeAll("/f.txt", "v2-content".encodeToByteArray()).getOrThrow()
+
+        val versions = fs.fileVersions("/f.txt").getOrThrow()
+        val v1Id = versions[0].versionId
+
+        // 恢复到 v1
+        fs.restoreVersion("/f.txt", v1Id).getOrThrow()
+
+        // 当前内容应为 v1
+        val current = fs.readAll("/f.txt").getOrThrow().decodeToString()
+        assertEquals("v1-content", current)
+
+        // 恢复操作应该保存了 v2 为新的历史版本
+        val versionsAfter = fs.fileVersions("/f.txt").getOrThrow()
+        assertTrue(versionsAfter.size >= 2)
+    }
+
+    @Test
+    fun version_history_not_found() = runTest {
+        val fs = createFs()
+        val result = fs.fileVersions("/missing.txt")
+        assertTrue(result.isFailure)
+        assertIs<FsError.NotFound>(result.exceptionOrNull())
+    }
+
+    @Test
+    fun read_version_invalid_id() = runTest {
+        val fs = createFs()
+        fs.writeAll("/f.txt", "data".encodeToByteArray()).getOrThrow()
+        val result = fs.readVersion("/f.txt", "non-existent-id")
+        assertTrue(result.isFailure)
+        assertIs<FsError.NotFound>(result.exceptionOrNull())
+    }
+
+    @Test
+    fun version_history_mount_returns_empty() = runTest {
+        val fs = createFs()
+        val diskOps = FakeDiskFileOperations()
+        fs.mount("/mnt", diskOps).getOrThrow()
+        diskOps.files["/f.txt"] = "data".encodeToByteArray()
+
+        val versions = fs.fileVersions("/mnt/f.txt").getOrThrow()
+        assertTrue(versions.isEmpty())
+    }
+
+    @Test
+    fun version_persisted_across_instances() = runTest {
+        val storage = InMemoryFsStorage()
+        val persistCfg = com.hrm.fs.core.persistence.PersistenceConfig(autoSnapshotEvery = 1)
+
+        val fs1 = InMemoryFileSystem(storage = storage, persistenceConfig = persistCfg)
+        fs1.writeAll("/f.txt", "v1".encodeToByteArray()).getOrThrow()
+        fs1.writeAll("/f.txt", "v2".encodeToByteArray()).getOrThrow()
+
+        // 使用相同 storage 创建新实例，版本历史应通过快照保留
+        val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = persistCfg)
+        val versions = fs2.fileVersions("/f.txt").getOrThrow()
+        assertEquals(1, versions.size)
+
+        val oldContent = fs2.readVersion("/f.txt", versions[0].versionId).getOrThrow()
+        assertEquals("v1", oldContent.decodeToString())
     }
 }
 

@@ -1,9 +1,11 @@
 package com.hrm.fs.core
 
+import com.hrm.fs.api.ChecksumAlgorithm
 import com.hrm.fs.api.DiskFileOperations
 import com.hrm.fs.api.DiskFileWatcher
 import com.hrm.fs.api.FileHandle
 import com.hrm.fs.api.FileSystem
+import com.hrm.fs.api.FileVersion
 import com.hrm.fs.api.FsEntry
 import com.hrm.fs.api.FsError
 import com.hrm.fs.api.FsEvent
@@ -17,6 +19,7 @@ import com.hrm.fs.api.MountOptions
 import com.hrm.fs.api.OpenMode
 import com.hrm.fs.api.PathUtils
 import com.hrm.fs.api.PendingMount
+import com.hrm.fs.api.QuotaInfo
 import com.hrm.fs.core.VfsMetricsCollector.Op
 import com.hrm.fs.core.persistence.PersistenceConfig
 import com.hrm.fs.core.persistence.SnapshotPermissions
@@ -43,7 +46,9 @@ import kotlinx.coroutines.sync.withLock
 internal class InMemoryFileSystem(
     storage: FsStorage? = null,
     persistenceConfig: PersistenceConfig = PersistenceConfig(),
-    watcherScope: CoroutineScope? = null
+    watcherScope: CoroutineScope? = null,
+    /** 虚拟磁盘空间配额（字节），-1 表示无限制。仅约束内存文件树。 */
+    private val quotaBytes: Long = -1
 ) : FileSystem {
 
     private val mutex = Mutex()
@@ -74,6 +79,75 @@ internal class InMemoryFileSystem(
     override fun metrics(): FsMetrics = mc.snapshot()
 
     override fun resetMetrics() = mc.reset()
+
+    override fun quotaInfo(): QuotaInfo = QuotaInfo(
+        quotaBytes = quotaBytes,
+        usedBytes = tree.totalUsedBytes()
+    )
+
+    // ═══════════════════════════════════════════════════════════
+    // 文件哈希 / 校验
+    // ═══════════════════════════════════════════════════════════
+
+    override suspend fun checksum(path: String, algorithm: ChecksumAlgorithm): Result<String> =
+        locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            // 读取完整文件内容
+            val data = readAllBytes(normalized).getOrElse { return@locked Result.failure(it) }
+            val hash = when (algorithm) {
+                ChecksumAlgorithm.CRC32 -> VfsChecksum.crc32(data)
+                ChecksumAlgorithm.SHA256 -> VfsChecksum.sha256(data)
+            }
+            Result.success(hash)
+        }
+
+    /** 读取文件全部内容（内部使用，不经过 metrics/handle）。 */
+    private suspend fun readAllBytes(normalized: String): Result<ByteArray> {
+        val match = mountTable.findMount(normalized)
+        if (match != null) {
+            // 挂载点：先 stat 取大小，再全量读取
+            val meta = match.diskOps.stat(match.relativePath).getOrElse { return Result.failure(it) }
+            if (meta.type != FsType.FILE) return Result.failure(FsError.NotFile(normalized))
+            return match.diskOps.readFile(match.relativePath, 0, meta.size.toInt())
+        }
+        val node = tree.resolveNodeOrError(normalized).getOrElse { return Result.failure(it) }
+        if (node !is FileNode) return Result.failure(FsError.NotFile(normalized))
+        if (!node.permissions.canRead()) return Result.failure(FsError.PermissionDenied(normalized))
+        return Result.success(node.blocks.toByteArray())
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 版本历史
+    // ═══════════════════════════════════════════════════════════
+
+    override suspend fun fileVersions(path: String): Result<List<FileVersion>> = locked {
+        ensureLoaded()
+        val normalized = PathUtils.normalize(path)
+        // 挂载点文件不支持版本追踪
+        if (mountTable.findMount(normalized) != null) return@locked Result.success(emptyList())
+        tree.fileVersions(normalized)
+    }
+
+    override suspend fun readVersion(path: String, versionId: String): Result<ByteArray> = locked {
+        ensureLoaded()
+        val normalized = PathUtils.normalize(path)
+        tree.readVersion(normalized, versionId)
+    }
+
+    override suspend fun restoreVersion(path: String, versionId: String): Result<Unit> = locked {
+        ensureLoaded()
+        val normalized = PathUtils.normalize(path)
+        tree.restoreVersion(normalized, versionId).also { result ->
+            if (result.isSuccess) {
+                val node = tree.resolveNode(normalized) as? FileNode
+                if (node != null) {
+                    walAppend(WalEntry.Write(normalized, 0, node.blocks.toByteArray()))
+                }
+                eventBus.emit(normalized, FsEventKind.MODIFIED)
+            }
+        }
+    }
 
     // ═══════════════════════════════════════════════════════════
     // mount / unmount
@@ -548,6 +622,11 @@ internal class InMemoryFileSystem(
 
     internal suspend fun writeAt(node: FileNode, offset: Long, data: ByteArray): Result<Unit> =
         locked {
+            // 配额检查：计算写入后的净增量
+            val end = offset.toInt() + data.size
+            val growth = maxOf(0L, end.toLong() - node.size.toLong())
+            checkQuota(growth)?.let { return@locked it }
+
             tree.writeAt(node, offset, data).also { result ->
                 if (result.isSuccess) {
                     walAppend(WalEntry.Write(tree.pathForNode(node), offset, data))
@@ -610,4 +689,21 @@ internal class InMemoryFileSystem(
 
     private fun readOnlyError(path: String): Result<Nothing> =
         Result.failure(FsError.PermissionDenied("挂载点只读: $path"))
+
+    /**
+     * 检查写入 [additionalBytes] 字节后是否超出配额。
+     * 若超出配额则返回错误 Result，否则返回 null。
+     */
+    private fun checkQuota(additionalBytes: Long): Result<Unit>? {
+        if (quotaBytes < 0) return null  // 无限制
+        val used = tree.totalUsedBytes()
+        if (used + additionalBytes > quotaBytes) {
+            return Result.failure(
+                FsError.QuotaExceeded(
+                    "配额不足: 已用 $used / 限额 $quotaBytes，需要额外 $additionalBytes 字节"
+                )
+            )
+        }
+        return null
+    }
 }

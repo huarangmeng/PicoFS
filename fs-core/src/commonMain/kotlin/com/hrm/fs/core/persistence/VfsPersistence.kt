@@ -64,10 +64,18 @@ internal data class SnapshotNode(
     val modifiedAtMillis: Long,
     val permissions: SnapshotPermissions,
     val content: ByteArray? = null,
-    val children: List<SnapshotNode>? = null
+    val children: List<SnapshotNode>? = null,
+    val versions: List<SnapshotVersionEntry>? = null
 ) {
     fun fsType(): FsType = if (type == "DIRECTORY") FsType.DIRECTORY else FsType.FILE
 }
+
+@Serializable
+internal data class SnapshotVersionEntry(
+    val versionId: String,
+    val timestampMillis: Long,
+    val data: ByteArray
+)
 
 @Serializable
 internal sealed class WalEntry {

@@ -67,17 +67,17 @@
   - **✅ IO 统计与可观测性**（操作计数、成功/失败数、耗时统计、字节吞吐、`metrics()`/`resetMetrics()` API）
 - **性能与扩展**
   - **✅ 缓存策略**（挂载点 stat/readDir 结果 LRU 缓存，自动失效）
-  - **⬜ 大文件分块**（Block/Page 存储，避免单一 ByteArray 占用连续大内存）
-  - **⬜ 磁盘空间配额**（虚拟磁盘容量限制）
+  - **✅ 大文件分块**（BlockStorage 64KB 分块，按需分配，避免单一 ByteArray 占用连续大内存）
+  - **✅ 磁盘空间配额**（`quotaBytes` 参数限制虚拟磁盘容量，`quotaInfo()` API 查询用量）
 - **高级功能**
   - **⬜ 符号链接**（symlink / hardlink）
   - **✅ 文件锁**（flock，文件级并发控制，共享锁/独占锁/锁升级/挂起等待）
   - **⬜ 搜索 / 查找**（按文件名/内容搜索，类 find/grep）
   - **⬜ 文件扩展属性**（xattr / 自定义标签）
   - **⬜ 压缩 / 解压**（zip/tar 归档操作）
-  - **⬜ 文件哈希 / 校验**（MD5/SHA 完整性校验）
+  - **✅ 文件哈希 / 校验**（纯 Kotlin 实现 CRC32/SHA-256，`checksum()` API 支持内存文件与挂载点文件）
   - **⬜ 回收站**（软删除 + 恢复机制）
-  - **⬜ 版本历史**（文件版本追踪 / diff）
+  - **✅ 版本历史**（写入自动保存历史版本，`fileVersions()`/`readVersion()`/`restoreVersion()` API，快照持久化）
 
 ### 当前接口概览
 
@@ -124,6 +124,17 @@ interface FileSystem {
     // 可观测性
     fun metrics(): FsMetrics
     fun resetMetrics()
+
+    // 配额
+    fun quotaInfo(): QuotaInfo
+
+    // 文件哈希
+    suspend fun checksum(path: String, algorithm: ChecksumAlgorithm = ChecksumAlgorithm.SHA256): Result<String>
+
+    // 版本历史
+    suspend fun fileVersions(path: String): Result<List<FileVersion>>
+    suspend fun readVersion(path: String, versionId: String): Result<ByteArray>
+    suspend fun restoreVersion(path: String, versionId: String): Result<Unit>
 }
 ```
 
