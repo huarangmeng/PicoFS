@@ -36,8 +36,9 @@ kotlin {
 
     sourceSets {
         commonMain.dependencies {
-            implementation(projects.fsCore)
-            implementation(projects.fsApi)
+            api(projects.fsCore)
+            api(projects.fsApi)
+            api(projects.fsPlatform)
             implementation(libs.compose.runtime)
             implementation(libs.compose.foundation)
             implementation(libs.compose.material3)

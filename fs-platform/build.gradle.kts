@@ -10,6 +10,7 @@ kotlin {
     androidLibrary {
         namespace = "com.hrm.fs.platform"
         compileSdk = libs.versions.android.compileSdk.get().toInt()
+        minSdk = libs.versions.android.minSdk.get().toInt()
     }
 
     listOf(
@@ -27,7 +28,8 @@ kotlin {
     sourceSets {
         commonMain {
             dependencies {
-
+                implementation(projects.fsApi)
+                implementation(libs.kotlinx.coroutines.core)
             }
         }
         commonTest {

@@ -1,27 +1,28 @@
 package com.hrm.fs.core
 
+import com.hrm.fs.api.DiskFileOperations
 import com.hrm.fs.api.FileHandle
 import com.hrm.fs.api.FsError
 import com.hrm.fs.api.OpenMode
 
-internal class InMemoryFileHandle(
-    private val fs: InMemoryFileSystem,
-    private val node: FileNode,
+internal class DiskFileHandle(
+    private val diskOps: DiskFileOperations,
+    private val relativePath: String,
     private val mode: OpenMode
 ) : FileHandle {
 
     override suspend fun readAt(offset: Long, length: Int): Result<ByteArray> {
-        if (mode == OpenMode.WRITE || !node.permissions.canRead()) {
+        if (mode == OpenMode.WRITE) {
             return Result.failure(FsError.PermissionDenied("read"))
         }
-        return fs.readAt(node, offset, length)
+        return diskOps.readFile(relativePath, offset, length)
     }
 
     override suspend fun writeAt(offset: Long, data: ByteArray): Result<Unit> {
-        if (mode == OpenMode.READ || !node.permissions.canWrite()) {
+        if (mode == OpenMode.READ) {
             return Result.failure(FsError.PermissionDenied("write"))
         }
-        return fs.writeAt(node, offset, data)
+        return diskOps.writeFile(relativePath, offset, data)
     }
 
     override suspend fun close(): Result<Unit> = Result.success(Unit)

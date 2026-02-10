@@ -10,7 +10,15 @@ import kotlinx.serialization.json.Json
 internal data class PersistenceConfig(
     val snapshotKey: String = "vfs_snapshot.json",
     val walKey: String = "vfs_wal.json",
+    val mountsKey: String = "vfs_mounts.json",
     val autoSnapshotEvery: Int = 20
+)
+
+@Serializable
+internal data class MountInfo(
+    val virtualPath: String,
+    val rootPath: String,
+    val readOnly: Boolean = false
 )
 
 internal object VfsPersistenceCodec {
@@ -27,6 +35,12 @@ internal object VfsPersistenceCodec {
 
     fun decodeWal(bytes: ByteArray): List<WalEntry> =
         json.decodeFromString(ListSerializer(WalEntry.serializer()), bytes.decodeToString())
+
+    fun encodeMounts(mounts: List<MountInfo>): ByteArray =
+        json.encodeToString(ListSerializer(MountInfo.serializer()), mounts).encodeToByteArray()
+
+    fun decodeMounts(bytes: ByteArray): List<MountInfo> =
+        json.decodeFromString(ListSerializer(MountInfo.serializer()), bytes.decodeToString())
 }
 
 @Serializable

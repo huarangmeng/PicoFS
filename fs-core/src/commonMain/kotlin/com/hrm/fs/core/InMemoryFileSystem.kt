@@ -1,79 +1,134 @@
 package com.hrm.fs.core
 
+import com.hrm.fs.api.DiskFileOperations
 import com.hrm.fs.api.FileHandle
 import com.hrm.fs.api.FileSystem
 import com.hrm.fs.api.FsEntry
 import com.hrm.fs.api.FsError
+import com.hrm.fs.api.FsEvent
+import com.hrm.fs.api.FsEventKind
 import com.hrm.fs.api.FsMeta
 import com.hrm.fs.api.FsPermissions
 import com.hrm.fs.api.FsStorage
+import com.hrm.fs.api.FsType
+import com.hrm.fs.api.MountOptions
 import com.hrm.fs.api.OpenMode
 import com.hrm.fs.api.PathUtils
+import com.hrm.fs.api.PendingMount
 import com.hrm.fs.core.persistence.PersistenceConfig
-import com.hrm.fs.core.persistence.SnapshotNode
 import com.hrm.fs.core.persistence.SnapshotPermissions
-import com.hrm.fs.core.persistence.VfsPersistenceCodec
 import com.hrm.fs.core.persistence.WalEntry
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlin.time.Clock
 
+/**
+ * 虚拟文件系统实现（门面层）。
+ *
+ * 组合四个内部组件完成所有功能：
+ * - [VfsTree]               — 纯内存文件树的增删改查 / 快照 / WAL
+ * - [MountTable]            — 挂载表管理 + 最长前缀匹配
+ * - [VfsEventBus]           — 事件发布 / 订阅
+ * - [VfsPersistenceManager] — WAL / Snapshot / Mount 持久化
+ */
 internal class InMemoryFileSystem(
-    private val storage: FsStorage? = null,
-    private val persistenceConfig: PersistenceConfig = PersistenceConfig()
+    storage: FsStorage? = null,
+    persistenceConfig: PersistenceConfig = PersistenceConfig()
 ) : FileSystem {
-    private val mutex = Mutex()
-    private var root = DirNode("/", nowMillis(), nowMillis(), FsPermissions.FULL)
-    private val walEntries: MutableList<WalEntry> = mutableListOf()
-    private var opsSinceSnapshot: Int = 0
 
-    init {
-        if (storage != null) {
-            locked {
-                loadFromStorage()
+    private val mutex = Mutex()
+    private val tree = VfsTree()
+    private val mountTable = MountTable()
+    private val eventBus = VfsEventBus()
+    private val persistence = VfsPersistenceManager(storage, persistenceConfig)
+
+    // ═══════════════════════════════════════════════════════════
+    // mount / unmount
+    // ═══════════════════════════════════════════════════════════
+
+    override suspend fun mount(
+        virtualPath: String,
+        diskOps: DiskFileOperations,
+        options: MountOptions
+    ): Result<Unit> = locked {
+        val normalized = PathUtils.normalize(virtualPath)
+        mountTable.mount(normalized, diskOps, options).getOrElse { return@locked Result.failure(it) }
+        tree.ensureDirPath(normalized)
+        persistence.persistMounts(mountTable.toMountInfoList())
+        Result.success(Unit)
+    }
+
+    override suspend fun unmount(virtualPath: String): Result<Unit> = locked {
+        val normalized = PathUtils.normalize(virtualPath)
+        mountTable.unmount(normalized).getOrElse { return@locked Result.failure(it) }
+        persistence.persistMounts(mountTable.toMountInfoList())
+        Result.success(Unit)
+    }
+
+    override suspend fun listMounts(): List<String> = locked {
+        mountTable.listMounts()
+    }
+
+    override suspend fun pendingMounts(): List<PendingMount> = locked {
+        ensureLoaded()
+        mountTable.pendingMounts().map { info ->
+            PendingMount(info.virtualPath, info.rootPath, info.readOnly)
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 基础 CRUD
+    // ═══════════════════════════════════════════════════════════
+
+    override suspend fun createFile(path: String): Result<Unit> = locked {
+        ensureLoaded()
+        val normalized = PathUtils.normalize(path)
+        val match = mountTable.findMount(normalized)
+        if (match != null) {
+            if (match.options.readOnly) return@locked readOnlyError(normalized)
+            val result = match.diskOps.createFile(match.relativePath)
+            if (result.isSuccess) eventBus.emit(normalized, FsEventKind.CREATED)
+            return@locked result
+        }
+        tree.createFile(normalized).also { result ->
+            if (result.isSuccess) {
+                walAppend(WalEntry.CreateFile(normalized))
+                eventBus.emit(normalized, FsEventKind.CREATED)
             }
         }
     }
 
-    override fun createFile(path: String): Result<Unit> = locked {
-        val normalized = PathUtils.normalize(path)
-        val (parent, name) = splitParent(normalized)
-        val parentNode = resolveDirOrError(parent).getOrElse { return@locked Result.failure(it) }
-        if (!parentNode.permissions.canWrite()) {
-            return@locked Result.failure(FsError.PermissionDenied(parent))
-        }
-        if (parentNode.children.containsKey(name)) {
-            return@locked Result.failure(FsError.AlreadyExists(normalized))
-        }
-        val now = nowMillis()
-        parentNode.children[name] = FileNode(name, now, now, FsPermissions.FULL)
-        parentNode.modifiedAtMillis = now
-        appendWal(WalEntry.CreateFile(normalized))
-        Result.success(Unit)
-    }
-
-    override fun createDir(path: String): Result<Unit> = locked {
+    override suspend fun createDir(path: String): Result<Unit> = locked {
+        ensureLoaded()
         val normalized = PathUtils.normalize(path)
         if (normalized == "/") return@locked Result.success(Unit)
-        val (parent, name) = splitParent(normalized)
-        val parentNode = resolveDirOrError(parent).getOrElse { return@locked Result.failure(it) }
-        if (!parentNode.permissions.canWrite()) {
-            return@locked Result.failure(FsError.PermissionDenied(parent))
+        val match = mountTable.findMount(normalized)
+        if (match != null) {
+            if (match.options.readOnly) return@locked readOnlyError(normalized)
+            val result = match.diskOps.createDir(match.relativePath)
+            if (result.isSuccess) eventBus.emit(normalized, FsEventKind.CREATED)
+            return@locked result
         }
-        if (parentNode.children.containsKey(name)) {
-            return@locked Result.failure(FsError.AlreadyExists(normalized))
+        tree.createDir(normalized).also { result ->
+            if (result.isSuccess) {
+                walAppend(WalEntry.CreateDir(normalized))
+                eventBus.emit(normalized, FsEventKind.CREATED)
+            }
         }
-        val now = nowMillis()
-        parentNode.children[name] = DirNode(name, now, now, FsPermissions.FULL)
-        parentNode.modifiedAtMillis = now
-        appendWal(WalEntry.CreateDir(normalized))
-        Result.success(Unit)
     }
 
-    override fun open(path: String, mode: OpenMode): Result<FileHandle> = locked {
+    override suspend fun open(path: String, mode: OpenMode): Result<FileHandle> = locked {
+        ensureLoaded()
         val normalized = PathUtils.normalize(path)
-        val node = resolveNodeOrError(normalized).getOrElse { return@locked Result.failure(it) }
+        val match = mountTable.findMount(normalized)
+        if (match != null) {
+            if (match.options.readOnly && mode != OpenMode.READ) {
+                return@locked Result.failure(FsError.PermissionDenied("挂载点只读: $normalized"))
+            }
+            return@locked Result.success(DiskFileHandle(match.diskOps, match.relativePath, mode))
+        }
+        val node = tree.resolveNodeOrError(normalized).getOrElse { return@locked Result.failure(it) }
         if (node !is FileNode) return@locked Result.failure(FsError.NotFile(normalized))
         if (!hasAccess(node.permissions, mode)) {
             return@locked Result.failure(FsError.PermissionDenied(normalized))
@@ -81,133 +136,235 @@ internal class InMemoryFileSystem(
         Result.success(InMemoryFileHandle(this, node, mode))
     }
 
-    override fun readDir(path: String): Result<List<FsEntry>> = locked {
+    override suspend fun readDir(path: String): Result<List<FsEntry>> = locked {
+        ensureLoaded()
         val normalized = PathUtils.normalize(path)
-        val dir = resolveDirOrError(normalized).getOrElse { return@locked Result.failure(it) }
-        if (!dir.permissions.canRead()) {
-            return@locked Result.failure(FsError.PermissionDenied(normalized))
-        }
-        val items = dir.children.values.map { FsEntry(it.name, it.type) }
-        Result.success(items)
+        val match = mountTable.findMount(normalized)
+        if (match != null) return@locked match.diskOps.list(match.relativePath)
+        tree.readDir(normalized)
     }
 
-    override fun stat(path: String): Result<FsMeta> = locked {
+    override suspend fun stat(path: String): Result<FsMeta> = locked {
+        ensureLoaded()
         val normalized = PathUtils.normalize(path)
-        val node = resolveNodeOrError(normalized).getOrElse { return@locked Result.failure(it) }
-        if (!node.permissions.canRead()) {
-            return@locked Result.failure(FsError.PermissionDenied(normalized))
+        val match = mountTable.findMount(normalized)
+        if (match != null) {
+            return@locked match.diskOps.stat(match.relativePath).map { it.copy(path = normalized) }
         }
-        val size = if (node is FileNode) node.size.toLong() else 0L
-        Result.success(
-            FsMeta(
-                path = normalized,
-                type = node.type,
-                size = size,
-                createdAtMillis = node.createdAtMillis,
-                modifiedAtMillis = node.modifiedAtMillis,
-                permissions = node.permissions
-            )
-        )
+        tree.stat(normalized)
     }
 
-    override fun delete(path: String): Result<Unit> = locked {
+    override suspend fun delete(path: String): Result<Unit> = locked {
+        ensureLoaded()
         val normalized = PathUtils.normalize(path)
         if (normalized == "/") return@locked Result.failure(FsError.PermissionDenied("/"))
-        val (parent, name) = splitParent(normalized)
-        val parentNode = resolveDirOrError(parent).getOrElse { return@locked Result.failure(it) }
-        if (!parentNode.permissions.canWrite()) {
-            return@locked Result.failure(FsError.PermissionDenied(parent))
+        if (mountTable.isMountPoint(normalized)) {
+            return@locked Result.failure(FsError.PermissionDenied("不能删除挂载点: $normalized"))
         }
-        val node =
-            parentNode.children[name] ?: return@locked Result.failure(FsError.NotFound(normalized))
-        if (node is DirNode && node.children.isNotEmpty()) {
-            return@locked Result.failure(FsError.PermissionDenied(normalized))
+        val match = mountTable.findMount(normalized)
+        if (match != null) {
+            if (match.options.readOnly) return@locked readOnlyError(normalized)
+            val result = match.diskOps.delete(match.relativePath)
+            if (result.isSuccess) eventBus.emit(normalized, FsEventKind.DELETED)
+            return@locked result
         }
-        parentNode.children.remove(name)
-        parentNode.modifiedAtMillis = nowMillis()
-        appendWal(WalEntry.Delete(normalized))
-        Result.success(Unit)
+        tree.delete(normalized).also { result ->
+            if (result.isSuccess) {
+                walAppend(WalEntry.Delete(normalized))
+                eventBus.emit(normalized, FsEventKind.DELETED)
+            }
+        }
     }
 
-    override fun setPermissions(path: String, permissions: FsPermissions): Result<Unit> = locked {
+    override suspend fun setPermissions(path: String, permissions: FsPermissions): Result<Unit> = locked {
+        ensureLoaded()
         val normalized = PathUtils.normalize(path)
-        val node = resolveNodeOrError(normalized).getOrElse { return@locked Result.failure(it) }
-        node.permissions = permissions
-        node.modifiedAtMillis = nowMillis()
-        appendWal(WalEntry.SetPermissions(normalized, SnapshotPermissions.from(permissions)))
-        Result.success(Unit)
+        if (mountTable.findMount(normalized) != null) return@locked Result.success(Unit)
+        tree.setPermissions(normalized, permissions).also { result ->
+            if (result.isSuccess) {
+                walAppend(WalEntry.SetPermissions(normalized, SnapshotPermissions.from(permissions)))
+            }
+        }
     }
 
-    internal fun readAt(node: FileNode, offset: Long, length: Int): Result<ByteArray> = locked {
-        if (!node.permissions.canRead()) return@locked Result.failure(FsError.PermissionDenied(node.name))
-        if (offset < 0 || length < 0) return@locked Result.failure(FsError.InvalidPath("offset/length"))
-        if (offset >= node.size) return@locked Result.success(ByteArray(0))
-        val available = node.size - offset.toInt()
-        val readLen = minOf(available, length)
-        val out = ByteArray(readLen)
-        node.content.copyInto(
-            out,
-            destinationOffset = 0,
-            startIndex = offset.toInt(),
-            endIndex = offset.toInt() + readLen
-        )
-        Result.success(out)
-    }
+    // ═══════════════════════════════════════════════════════════
+    // 递归操作
+    // ═══════════════════════════════════════════════════════════
 
-    internal fun writeAt(node: FileNode, offset: Long, data: ByteArray): Result<Unit> = locked {
-        if (!node.permissions.canWrite()) return@locked Result.failure(FsError.PermissionDenied(node.name))
-        if (offset < 0) return@locked Result.failure(FsError.InvalidPath("offset"))
-        val end = offset.toInt() + data.size
-        ensureCapacity(node, end)
-        data.copyInto(node.content, destinationOffset = offset.toInt())
-        if (end > node.size) node.size = end
-        node.modifiedAtMillis = nowMillis()
-        appendWal(WalEntry.Write(pathForNode(node), offset, data))
-        Result.success(Unit)
-    }
-
-    private fun ensureCapacity(node: FileNode, size: Int) {
-        if (size <= node.content.size) return
-        val newSize = maxOf(size, node.content.size * 2 + 1)
-        val newBuffer = ByteArray(newSize)
-        node.content.copyInto(newBuffer, endIndex = node.size)
-        node.content = newBuffer
-    }
-
-    private fun resolveNodeOrError(path: String): Result<VfsNode> {
-        val node = resolveNode(path) ?: return Result.failure(FsError.NotFound(path))
-        return Result.success(node)
-    }
-
-    private fun resolveDirOrError(path: String): Result<DirNode> {
-        val node = resolveNode(path) ?: return Result.failure(FsError.NotFound(path))
-        if (node !is DirNode) return Result.failure(FsError.NotDirectory(path))
-        return Result.success(node)
-    }
-
-    private fun resolveNode(path: String): VfsNode? {
-        if (path == "/") return root
-        val parts = path.removePrefix("/").split("/").filter { it.isNotBlank() }
-        var current: VfsNode = root
+    override suspend fun createDirRecursive(path: String): Result<Unit> {
+        val normalized = PathUtils.normalize(path)
+        if (normalized == "/") return Result.success(Unit)
+        val parts = normalized.removePrefix("/").split("/")
+        var current = ""
         for (part in parts) {
-            if (current !is DirNode) return null
-            current = current.children[part] ?: return null
+            current = "$current/$part"
+            val result = createDir(current)
+            if (result.isFailure) {
+                val err = result.exceptionOrNull()
+                if (err is FsError.AlreadyExists) continue
+                return result
+            }
         }
-        return current
+        return Result.success(Unit)
     }
 
-    private fun splitParent(path: String): Pair<String, String> {
+    override suspend fun deleteRecursive(path: String): Result<Unit> {
         val normalized = PathUtils.normalize(path)
-        val idx = normalized.lastIndexOf('/')
-        return if (idx <= 0) "/" to normalized.removePrefix("/")
-        else normalized.take(idx) to normalized.substring(idx + 1)
+        if (normalized == "/") return Result.failure(FsError.PermissionDenied("/"))
+        if (mountTable.isMountPoint(normalized)) {
+            return Result.failure(FsError.PermissionDenied("不能删除挂载点: $normalized"))
+        }
+        val meta = stat(normalized).getOrElse { return Result.failure(it) }
+        if (meta.type == FsType.FILE) return delete(normalized)
+        val entries = readDir(normalized).getOrElse { return Result.failure(it) }
+        for (entry in entries) {
+            val childPath = if (normalized == "/") "/${entry.name}" else "$normalized/${entry.name}"
+            deleteRecursive(childPath).getOrElse { return Result.failure(it) }
+        }
+        return delete(normalized)
     }
 
-    private fun nowMillis(): Long = Clock.System.now().toEpochMilliseconds()
+    // ═══════════════════════════════════════════════════════════
+    // 便捷读写
+    // ═══════════════════════════════════════════════════════════
 
-    private fun <T> locked(block: () -> T): T = runBlocking {
-        mutex.withLock { block() }
+    override suspend fun readAll(path: String): Result<ByteArray> {
+        val handle = open(path, OpenMode.READ).getOrElse { return Result.failure(it) }
+        return try {
+            val meta = stat(path).getOrElse { return Result.failure(it) }
+            handle.readAt(0, meta.size.toInt())
+        } finally {
+            handle.close()
+        }
     }
+
+    override suspend fun writeAll(path: String, data: ByteArray): Result<Unit> {
+        val normalized = PathUtils.normalize(path)
+        val parentPath = normalized.substringBeforeLast('/', "/")
+        if (parentPath != "/") {
+            createDirRecursive(parentPath).getOrElse { return Result.failure(it) }
+        }
+        if (stat(normalized).isFailure) {
+            createFile(normalized).getOrElse { return Result.failure(it) }
+        }
+        val handle = open(normalized, OpenMode.WRITE).getOrElse { return Result.failure(it) }
+        return try {
+            val result = handle.writeAt(0, data)
+            if (result.isSuccess) eventBus.emit(normalized, FsEventKind.MODIFIED)
+            result
+        } finally {
+            handle.close()
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // copy / move
+    // ═══════════════════════════════════════════════════════════
+
+    override suspend fun copy(srcPath: String, dstPath: String): Result<Unit> {
+        val src = PathUtils.normalize(srcPath)
+        val dst = PathUtils.normalize(dstPath)
+        val meta = stat(src).getOrElse { return Result.failure(it) }
+        if (meta.type == FsType.FILE) {
+            val data = readAll(src).getOrElse { return Result.failure(it) }
+            return writeAll(dst, data)
+        }
+        createDirRecursive(dst).getOrElse { return Result.failure(it) }
+        val entries = readDir(src).getOrElse { return Result.failure(it) }
+        for (entry in entries) {
+            copy("$src/${entry.name}", "$dst/${entry.name}").getOrElse { return Result.failure(it) }
+        }
+        return Result.success(Unit)
+    }
+
+    override suspend fun move(srcPath: String, dstPath: String): Result<Unit> {
+        copy(srcPath, dstPath).getOrElse { return Result.failure(it) }
+        return deleteRecursive(srcPath)
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 监听
+    // ═══════════════════════════════════════════════════════════
+
+    override fun watch(path: String): Flow<FsEvent> = eventBus.watch(path)
+
+    // ═══════════════════════════════════════════════════════════
+    // 流式读写
+    // ═══════════════════════════════════════════════════════════
+
+    override fun readStream(path: String, chunkSize: Int): Flow<ByteArray> = flow {
+        val normalized = PathUtils.normalize(path)
+        val handle = open(normalized, OpenMode.READ).getOrThrow()
+        try {
+            var offset = 0L
+            while (true) {
+                val chunk = handle.readAt(offset, chunkSize).getOrThrow()
+                if (chunk.isEmpty()) break
+                emit(chunk)
+                offset += chunk.size
+            }
+        } finally {
+            handle.close()
+        }
+    }
+
+    override suspend fun writeStream(path: String, dataFlow: Flow<ByteArray>): Result<Unit> {
+        val normalized = PathUtils.normalize(path)
+        val parentPath = normalized.substringBeforeLast('/', "/")
+        if (parentPath != "/") {
+            createDirRecursive(parentPath).getOrElse { return Result.failure(it) }
+        }
+        if (stat(normalized).isFailure) {
+            createFile(normalized).getOrElse { return Result.failure(it) }
+        }
+        val handle = open(normalized, OpenMode.WRITE).getOrElse { return Result.failure(it) }
+        return try {
+            var offset = 0L
+            dataFlow.collect { chunk ->
+                handle.writeAt(offset, chunk).getOrThrow()
+                offset += chunk.size
+            }
+            eventBus.emit(normalized, FsEventKind.MODIFIED)
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(e)
+        } finally {
+            handle.close()
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // InMemoryFileHandle 的 readAt / writeAt（内部调用）
+    // ═══════════════════════════════════════════════════════════
+
+    internal suspend fun readAt(node: FileNode, offset: Long, length: Int): Result<ByteArray> = locked {
+        tree.readAt(node, offset, length)
+    }
+
+    internal suspend fun writeAt(node: FileNode, offset: Long, data: ByteArray): Result<Unit> = locked {
+        tree.writeAt(node, offset, data).also { result ->
+            if (result.isSuccess) {
+                walAppend(WalEntry.Write(tree.pathForNode(node), offset, data))
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 私有辅助
+    // ═══════════════════════════════════════════════════════════
+
+    private suspend fun ensureLoaded() {
+        val loadResult = persistence.ensureLoaded() ?: return
+        loadResult.snapshot?.let { tree.restoreFromSnapshot(it) }
+        if (loadResult.walEntries.isNotEmpty()) tree.replayWal(loadResult.walEntries)
+        if (loadResult.mountInfos.isNotEmpty()) mountTable.restoreFromPersistence(loadResult.mountInfos)
+    }
+
+    private suspend fun walAppend(entry: WalEntry) {
+        persistence.appendWal(entry) { tree.toSnapshot() }
+    }
+
+    private suspend fun <T> locked(block: suspend () -> T): T = mutex.withLock { block() }
 
     private fun hasAccess(perms: FsPermissions, mode: OpenMode): Boolean = when (mode) {
         OpenMode.READ -> perms.canRead()
@@ -215,172 +372,6 @@ internal class InMemoryFileSystem(
         OpenMode.READ_WRITE -> perms.canRead() && perms.canWrite()
     }
 
-    private fun pathForNode(node: FileNode): String {
-        val result = StringBuilder()
-        fun dfs(current: VfsNode, target: FileNode, prefix: String): Boolean {
-            if (current == target) {
-                result.append(prefix)
-                return true
-            }
-            if (current is DirNode) {
-                for ((name, child) in current.children) {
-                    val next = if (prefix == "/") "/$name" else "$prefix/$name"
-                    if (dfs(child, target, next)) return true
-                }
-            }
-            return false
-        }
-        dfs(root, node, "/")
-        return result.toString().ifBlank { "/" }
-    }
-
-    private fun loadFromStorage() {
-        val snapshotBytes = storage?.read(persistenceConfig.snapshotKey)?.getOrNull()
-        if (snapshotBytes != null) {
-            val snapshot = VfsPersistenceCodec.decodeSnapshot(snapshotBytes)
-            root = buildFromSnapshot(snapshot)
-        }
-        val walBytes = storage?.read(persistenceConfig.walKey)?.getOrNull()
-        if (walBytes != null) {
-            walEntries.clear()
-            walEntries.addAll(VfsPersistenceCodec.decodeWal(walBytes))
-            applyWalEntries(walEntries)
-        }
-    }
-
-    private fun applyWalEntries(entries: List<WalEntry>) {
-        entries.forEach { entry ->
-            when (entry) {
-                is WalEntry.CreateFile -> createFileInternal(entry.path)
-                is WalEntry.CreateDir -> createDirInternal(entry.path)
-                is WalEntry.Delete -> deleteInternal(entry.path)
-                is WalEntry.Write -> writeInternal(entry.path, entry.offset, entry.data)
-                is WalEntry.SetPermissions -> setPermissionsInternal(
-                    entry.path,
-                    entry.permissions.toFsPermissions()
-                )
-            }
-        }
-    }
-
-    private fun appendWal(entry: WalEntry) {
-        if (storage == null) return
-        walEntries.add(entry)
-        opsSinceSnapshot++
-        storage.write(persistenceConfig.walKey, VfsPersistenceCodec.encodeWal(walEntries))
-        if (opsSinceSnapshot >= persistenceConfig.autoSnapshotEvery) {
-            saveSnapshot()
-        }
-    }
-
-    private fun saveSnapshot() {
-        if (storage == null) return
-        val snapshot = snapshotFromNode(root)
-        storage.write(persistenceConfig.snapshotKey, VfsPersistenceCodec.encodeSnapshot(snapshot))
-        walEntries.clear()
-        storage.write(persistenceConfig.walKey, VfsPersistenceCodec.encodeWal(walEntries))
-        opsSinceSnapshot = 0
-    }
-
-    private fun snapshotFromNode(node: VfsNode): SnapshotNode {
-        return when (node) {
-            is DirNode -> SnapshotNode(
-                name = node.name,
-                type = node.type.name,
-                createdAtMillis = node.createdAtMillis,
-                modifiedAtMillis = node.modifiedAtMillis,
-                permissions = SnapshotPermissions.from(node.permissions),
-                children = node.children.values.map { snapshotFromNode(it) }
-            )
-
-            is FileNode -> SnapshotNode(
-                name = node.name,
-                type = node.type.name,
-                createdAtMillis = node.createdAtMillis,
-                modifiedAtMillis = node.modifiedAtMillis,
-                permissions = SnapshotPermissions.from(node.permissions),
-                content = node.content.copyOf(node.size)
-            )
-        }
-    }
-
-    private fun buildFromSnapshot(snapshot: SnapshotNode): DirNode {
-        fun build(node: SnapshotNode): VfsNode {
-            val perms = node.permissions.toFsPermissions()
-            return if (node.fsType() == com.hrm.fs.api.FsType.DIRECTORY) {
-                val dir = DirNode(node.name, node.createdAtMillis, node.modifiedAtMillis, perms)
-                node.children.orEmpty().forEach { child ->
-                    val built = build(child)
-                    dir.children[built.name] = built
-                }
-                dir
-            } else {
-                val file = FileNode(node.name, node.createdAtMillis, node.modifiedAtMillis, perms)
-                val content = node.content ?: ByteArray(0)
-                file.content = content.copyOf(content.size)
-                file.size = content.size
-                file
-            }
-        }
-
-        val built = build(snapshot)
-        return if (built is DirNode) built else DirNode(
-            "/",
-            nowMillis(),
-            nowMillis(),
-            FsPermissions.FULL
-        )
-    }
-
-    private fun createFileInternal(path: String) {
-        val normalized = PathUtils.normalize(path)
-        val (parent, name) = splitParent(normalized)
-        val parentNode = resolveDir(parent) ?: return
-        if (parentNode.children.containsKey(name)) return
-        val now = nowMillis()
-        parentNode.children[name] = FileNode(name, now, now, FsPermissions.FULL)
-        parentNode.modifiedAtMillis = now
-    }
-
-    private fun createDirInternal(path: String) {
-        val normalized = PathUtils.normalize(path)
-        if (normalized == "/") return
-        val (parent, name) = splitParent(normalized)
-        val parentNode = resolveDir(parent) ?: return
-        if (parentNode.children.containsKey(name)) return
-        val now = nowMillis()
-        parentNode.children[name] = DirNode(name, now, now, FsPermissions.FULL)
-        parentNode.modifiedAtMillis = now
-    }
-
-    private fun deleteInternal(path: String) {
-        val normalized = PathUtils.normalize(path)
-        if (normalized == "/") return
-        val (parent, name) = splitParent(normalized)
-        val parentNode = resolveDir(parent) ?: return
-        val node = parentNode.children[name] ?: return
-        if (node is DirNode && node.children.isNotEmpty()) return
-        parentNode.children.remove(name)
-        parentNode.modifiedAtMillis = nowMillis()
-    }
-
-    private fun writeInternal(path: String, offset: Long, data: ByteArray) {
-        val normalized = PathUtils.normalize(path)
-        val node = resolveNode(normalized)
-        if (node !is FileNode) return
-        val end = offset.toInt() + data.size
-        ensureCapacity(node, end)
-        data.copyInto(node.content, destinationOffset = offset.toInt())
-        if (end > node.size) node.size = end
-        node.modifiedAtMillis = nowMillis()
-    }
-
-    private fun setPermissionsInternal(path: String, permissions: FsPermissions) {
-        val normalized = PathUtils.normalize(path)
-        val node = resolveNode(normalized) ?: return
-        node.permissions = permissions
-        node.modifiedAtMillis = nowMillis()
-    }
-
-    private fun resolveDir(path: String): DirNode? = resolveNode(path) as? DirNode
+    private fun readOnlyError(path: String): Result<Nothing> =
+        Result.failure(FsError.PermissionDenied("挂载点只读: $path"))
 }

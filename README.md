@@ -40,8 +40,9 @@
   - **✅ 快照（Snapshot）**
   - **⚠️ 崩溃恢复验证**（需平台存储适配）
 - **持久化存储**
-  - **⚠️ 抽象存储接口**（`FsStorage`）
-  - **⬜ 平台文件存储实现**（Android/iOS/JVM）
+  - **✅ 抽象存储接口**（`FsStorage`）
+  - **✅ 映射真实目录**（Android/iOS/JVM）
+  - **⚠️ 外部变更感知**（依赖重新读取目录/刷新）
 - **可观测性**
   - **⬜ 事件总线/统计**（IO 次数、耗时、命中率）
 - **性能与扩展**
@@ -52,13 +53,13 @@
 
 ```kotlin
 interface FileSystem {
-    fun createFile(path: String): Result<Unit>
-    fun createDir(path: String): Result<Unit>
-    fun open(path: String, mode: OpenMode): Result<FileHandle>
-    fun readDir(path: String): Result<List<FsEntry>>
-    fun stat(path: String): Result<FsMeta>
-    fun delete(path: String): Result<Unit>
-    fun setPermissions(path: String, permissions: FsPermissions): Result<Unit>
+    suspend fun createFile(path: String): Result<Unit>
+    suspend fun createDir(path: String): Result<Unit>
+    suspend fun open(path: String, mode: OpenMode): Result<FileHandle>
+    suspend fun readDir(path: String): Result<List<FsEntry>>
+    suspend fun stat(path: String): Result<FsMeta>
+    suspend fun delete(path: String): Result<Unit>
+    suspend fun setPermissions(path: String, permissions: FsPermissions): Result<Unit>
 }
 ```
 
@@ -69,6 +70,13 @@ interface FileSystem {
 - **Android**：使用应用沙箱目录（`context.filesDir` / `context.noBackupFilesDir`）。
 - **iOS**：使用 `Documents/` 或 `Application Support/`。
 - **Desktop (JVM)**：使用 `user.home` 下的应用目录。
+
+### 真实文件映射（应用内根目录）
+
+- **目的**：VFS 操作直接落盘到应用根目录，`readDir`/`stat` 能感知到外部新增文件。
+- **实现**：由 `fs-core` 提供统一入口 `createFileSystem(FsConfig)`，通过参数选择 **虚拟** 或 **真实** 文件系统。
+- **Android 初始化**：在 `App(backend = FsBackend.REAL, rootPath = filesDir.absolutePath)` 传入根目录。
+- **外部变更感知**：当应用目录被外部写入后，调用 `readDir`/`stat` 将读取最新文件状态。
 
 ### 项目结构建议
 
