@@ -4,6 +4,7 @@ import com.hrm.fs.api.FsStorage
 import com.hrm.fs.core.persistence.MountInfo
 import com.hrm.fs.core.persistence.PersistenceConfig
 import com.hrm.fs.core.persistence.SnapshotNode
+import com.hrm.fs.core.persistence.SnapshotVersionData
 import com.hrm.fs.core.persistence.VfsPersistenceCodec
 import com.hrm.fs.core.persistence.WalEntry
 
@@ -32,7 +33,8 @@ internal class VfsPersistenceManager(
     data class LoadResult(
         val snapshot: SnapshotNode?,
         val walEntries: List<WalEntry>,
-        val mountInfos: List<MountInfo>
+        val mountInfos: List<MountInfo>,
+        val versionData: SnapshotVersionData?
     )
 
     suspend fun ensureLoaded(): LoadResult? {
@@ -61,7 +63,11 @@ internal class VfsPersistenceManager(
             VfsPersistenceCodec.decodeMounts(it)
         }.orEmpty()
 
-        return LoadResult(snapshot, wal, mountInfos)
+        val versionData = storage.read(config.versionsKey).getOrNull()?.let {
+            VfsPersistenceCodec.decodeVersionData(it)
+        }
+
+        return LoadResult(snapshot, wal, mountInfos, versionData)
     }
 
     // ── WAL ──────────────────────────────────────────────────
@@ -71,20 +77,28 @@ internal class VfsPersistenceManager(
      * 达到阈值时自动触发快照。
      *
      * @param snapshotProvider 生成当前快照的回调（惰性，仅在需要快照时调用）
+     * @param versionDataProvider 生成版本数据的回调（惰性）
      */
-    suspend fun appendWal(entry: WalEntry, snapshotProvider: () -> SnapshotNode) {
+    suspend fun appendWal(
+        entry: WalEntry,
+        snapshotProvider: () -> SnapshotNode,
+        versionDataProvider: () -> SnapshotVersionData
+    ) {
         if (storage == null) return
         walEntries.add(entry)
         opsSinceSnapshot++
         storage.write(config.walKey, VfsPersistenceCodec.encodeWal(walEntries))
         if (opsSinceSnapshot >= config.autoSnapshotEvery) {
-            saveSnapshot(snapshotProvider())
+            saveSnapshot(snapshotProvider(), versionDataProvider())
         }
     }
 
-    suspend fun saveSnapshot(snapshot: SnapshotNode) {
+    suspend fun saveSnapshot(snapshot: SnapshotNode, versionData: SnapshotVersionData? = null) {
         if (storage == null) return
         storage.write(config.snapshotKey, VfsPersistenceCodec.encodeSnapshot(snapshot))
+        if (versionData != null) {
+            storage.write(config.versionsKey, VfsPersistenceCodec.encodeVersionData(versionData))
+        }
         walEntries.clear()
         storage.write(config.walKey, VfsPersistenceCodec.encodeWal(walEntries))
         opsSinceSnapshot = 0

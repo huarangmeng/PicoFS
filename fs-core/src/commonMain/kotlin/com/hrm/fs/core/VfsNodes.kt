@@ -36,9 +36,6 @@ internal class FileNode(
         set(value) {
             blocks.size = value
         }
-
-    /** 版本历史（最新在前）。 */
-    internal val versions = mutableListOf<VersionSnapshot>()
 }
 
 // ── 分块存储 ─────────────────────────────────────────────────

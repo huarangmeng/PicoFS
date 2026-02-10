@@ -278,7 +278,7 @@ interface FileSystem {
     /**
      * 获取文件的版本历史列表（最新在前）。
      *
-     * 仅支持内存文件（挂载点文件返回空列表）。
+     * 支持内存文件和挂载点文件。
      * 每次通过 [FileHandle.writeAt]、[writeAll]、[writeStream] 写入时自动保存历史版本。
      *
      * @param path 虚拟路径

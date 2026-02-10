@@ -57,6 +57,7 @@ internal class InMemoryFileSystem(
     private val eventBus = VfsEventBus()
     private val persistence = VfsPersistenceManager(storage, persistenceConfig)
     private val mc = VfsMetricsCollector()
+    private val versionManager = VfsVersionManager()
     internal val fileLockManager = VfsFileLockManager()
 
     /** 挂载点 stat 结果的 LRU 缓存。 */
@@ -124,29 +125,55 @@ internal class InMemoryFileSystem(
     override suspend fun fileVersions(path: String): Result<List<FileVersion>> = locked {
         ensureLoaded()
         val normalized = PathUtils.normalize(path)
-        // 挂载点文件不支持版本追踪
-        if (mountTable.findMount(normalized) != null) return@locked Result.success(emptyList())
-        tree.fileVersions(normalized)
+        // 验证路径存在且为文件
+        val meta = statInternal(normalized).getOrElse { return@locked Result.failure(it) }
+        if (meta.type != FsType.FILE) return@locked Result.failure(FsError.NotFile(normalized))
+        Result.success(versionManager.fileVersions(normalized))
     }
 
     override suspend fun readVersion(path: String, versionId: String): Result<ByteArray> = locked {
         ensureLoaded()
         val normalized = PathUtils.normalize(path)
-        tree.readVersion(normalized, versionId)
+        versionManager.readVersion(normalized, versionId)
     }
 
     override suspend fun restoreVersion(path: String, versionId: String): Result<Unit> = locked {
         ensureLoaded()
         val normalized = PathUtils.normalize(path)
-        tree.restoreVersion(normalized, versionId).also { result ->
-            if (result.isSuccess) {
-                val node = tree.resolveNode(normalized) as? FileNode
-                if (node != null) {
-                    walAppend(WalEntry.Write(normalized, 0, node.blocks.toByteArray()))
-                }
-                eventBus.emit(normalized, FsEventKind.MODIFIED)
+        // 读取当前内容
+        val currentData = readAllBytes(normalized).getOrElse { return@locked Result.failure(it) }
+        // 从版本管理器获取历史内容（同时保存当前内容为新版本）
+        val historicalData = versionManager.restoreVersion(normalized, versionId, currentData)
+            .getOrElse { return@locked Result.failure(it) }
+        // 写回文件（不触发版本保存——因为 restoreVersion 已保存了）
+        val match = mountTable.findMount(normalized)
+        if (match != null) {
+            // 挂载点文件：通过 diskOps 写回
+            match.diskOps.writeFile(match.relativePath, 0, historicalData)
+                .getOrElse { return@locked Result.failure(it) }
+            invalidateCache(normalized)
+        } else {
+            // 内存文件：直接替换内容
+            val node = tree.resolveNode(normalized) as? FileNode
+                ?: return@locked Result.failure(FsError.NotFound(normalized))
+            node.blocks.clear()
+            if (historicalData.isNotEmpty()) {
+                node.blocks.write(0, historicalData)
             }
+            node.modifiedAtMillis = VfsTree.nowMillis()
+            walAppend(WalEntry.Write(normalized, 0, historicalData))
         }
+        eventBus.emit(normalized, FsEventKind.MODIFIED)
+        Result.success(Unit)
+    }
+
+    /** stat 内部实现（不走 metrics），支持内存和挂载。 */
+    private suspend fun statInternal(normalized: String): Result<FsMeta> {
+        val match = mountTable.findMount(normalized)
+        if (match != null) {
+            return match.diskOps.stat(match.relativePath).map { it.copy(path = normalized) }
+        }
+        return tree.stat(normalized)
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -228,8 +255,24 @@ internal class InMemoryFileSystem(
             }
             scanDisk(match.relativePath, "")
 
-            for ((rel, _) in diskEntries) {
+            for ((rel, type) in diskEntries) {
                 val vfsPath = "$mountPoint$rel"
+                // 文件变更时保存版本快照
+                if (type == FsType.FILE) {
+                    try {
+                        val diskPath = if (match.relativePath == "/") rel
+                        else "${match.relativePath}$rel"
+                        val meta = diskOps.stat(diskPath).getOrNull()
+                        if (meta != null && meta.type == FsType.FILE) {
+                            val data = diskOps.readFile(diskPath, 0, meta.size.toInt()).getOrNull()
+                            if (data != null && data.isNotEmpty()) {
+                                versionManager.saveVersion(vfsPath, data)
+                            }
+                        }
+                    } catch (_: Exception) {
+                        // 忽略读取失败
+                    }
+                }
                 invalidateCache(vfsPath)
                 events.add(FsEvent(vfsPath, FsEventKind.MODIFIED))
                 eventBus.emit(vfsPath, FsEventKind.MODIFIED)
@@ -500,6 +543,18 @@ internal class InMemoryFileSystem(
                 return fail
             }
         }
+
+        // 挂载点文件：在写入前保存版本（内存文件由 writeAt 内部处理）
+        val match = locked { mountTable.findMount(normalized) }
+        if (match != null) {
+            locked {
+                val currentData = readAllBytes(normalized).getOrNull()
+                if (currentData != null && currentData.isNotEmpty()) {
+                    versionManager.saveVersion(normalized, currentData)
+                }
+            }
+        }
+
         val handle = open(normalized, OpenMode.WRITE).getOrElse {
             val fail = Result.failure<Unit>(it)
             mc.end(Op.WRITE_ALL, mark, fail)
@@ -595,6 +650,18 @@ internal class InMemoryFileSystem(
         if (stat(normalized).isFailure) {
             createFile(normalized).getOrElse { return Result.failure(it) }
         }
+
+        // 挂载点文件：在写入前保存版本（内存文件由 writeAt 内部处理）
+        val match = locked { mountTable.findMount(normalized) }
+        if (match != null) {
+            locked {
+                val currentData = readAllBytes(normalized).getOrNull()
+                if (currentData != null && currentData.isNotEmpty()) {
+                    versionManager.saveVersion(normalized, currentData)
+                }
+            }
+        }
+
         val handle = open(normalized, OpenMode.WRITE).getOrElse { return Result.failure(it) }
         return try {
             var offset = 0L
@@ -627,9 +694,15 @@ internal class InMemoryFileSystem(
             val growth = maxOf(0L, end.toLong() - node.size.toLong())
             checkQuota(growth)?.let { return@locked it }
 
+            // 版本保存：写入前保存当前内容
+            val path = tree.pathForNode(node)
+            if (node.size > 0) {
+                versionManager.saveVersion(path, node.blocks.toByteArray())
+            }
+
             tree.writeAt(node, offset, data).also { result ->
                 if (result.isSuccess) {
-                    walAppend(WalEntry.Write(tree.pathForNode(node), offset, data))
+                    walAppend(WalEntry.Write(path, offset, data))
                 }
             }
         }
@@ -644,11 +717,41 @@ internal class InMemoryFileSystem(
             watcher.watchDisk(this).collect { diskEvent ->
                 val virtualPath = if (diskEvent.relativePath == "/") mountPoint
                 else "$mountPoint${diskEvent.relativePath}"
+                // 外部文件被修改时，保存当前内容为版本快照
+                if (diskEvent.kind == FsEventKind.MODIFIED) {
+                    saveExternalChangeVersion(virtualPath, diskOps, diskEvent.relativePath)
+                }
                 invalidateCache(virtualPath)
                 eventBus.emit(virtualPath, diskEvent.kind)
             }
         }
         watcherJobs[mountPoint] = job
+    }
+
+    /**
+     * 外部变更感知时保存版本快照。
+     *
+     * 外部程序直接修改磁盘文件后，无法获取修改前的内容，
+     * 因此保存的是检测到变更时的文件内容——作为"该时刻的快照"。
+     * 连续的外部变更会形成变更历史链。
+     */
+    private suspend fun saveExternalChangeVersion(
+        virtualPath: String,
+        diskOps: DiskFileOperations,
+        relativePath: String
+    ) {
+        locked {
+            try {
+                val meta = diskOps.stat(relativePath).getOrNull() ?: return@locked
+                if (meta.type != FsType.FILE) return@locked
+                val data = diskOps.readFile(relativePath, 0, meta.size.toInt()).getOrNull() ?: return@locked
+                if (data.isNotEmpty()) {
+                    versionManager.saveVersion(virtualPath, data)
+                }
+            } catch (_: Exception) {
+                // 文件可能在读取过程中被再次修改或删除，忽略异常
+            }
+        }
     }
 
     private fun stopDiskWatcher(mountPoint: String) {
@@ -664,10 +767,15 @@ internal class InMemoryFileSystem(
         loadResult.snapshot?.let { tree.restoreFromSnapshot(it) }
         if (loadResult.walEntries.isNotEmpty()) tree.replayWal(loadResult.walEntries)
         if (loadResult.mountInfos.isNotEmpty()) mountTable.restoreFromPersistence(loadResult.mountInfos)
+        loadResult.versionData?.let { versionManager.restoreFromSnapshot(it.entries) }
     }
 
     private suspend fun walAppend(entry: WalEntry) {
-        persistence.appendWal(entry) { tree.toSnapshot() }
+        persistence.appendWal(
+            entry,
+            snapshotProvider = { tree.toSnapshot() },
+            versionDataProvider = { versionManager.toSnapshotData() }
+        )
     }
 
     private suspend fun <T> locked(block: suspend () -> T): T = mutex.withLock { block() }

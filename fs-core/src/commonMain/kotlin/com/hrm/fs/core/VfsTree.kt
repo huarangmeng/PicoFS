@@ -1,6 +1,5 @@
 package com.hrm.fs.core
 
-import com.hrm.fs.api.FileVersion
 import com.hrm.fs.api.FsEntry
 import com.hrm.fs.api.FsError
 import com.hrm.fs.api.FsMeta
@@ -9,7 +8,6 @@ import com.hrm.fs.api.FsType
 import com.hrm.fs.api.PathUtils
 import com.hrm.fs.core.persistence.SnapshotNode
 import com.hrm.fs.core.persistence.SnapshotPermissions
-import com.hrm.fs.core.persistence.SnapshotVersionEntry
 import com.hrm.fs.core.persistence.WalEntry
 import kotlin.time.Clock
 
@@ -19,13 +17,8 @@ import kotlin.time.Clock
  * 负责内存中 [VfsNode] 树结构的增删改查、快照序列化 / 反序列化、WAL 回放。
  * **无线程安全保证**，外部需自行加锁。
  */
-internal class VfsTree(
-    /** 每个文件保留的最大版本数。 */
-    val maxVersions: Int = DEFAULT_MAX_VERSIONS
-) {
+internal class VfsTree {
     companion object {
-        const val DEFAULT_MAX_VERSIONS = 10
-
         fun splitParent(path: String): Pair<String, String> {
             val normalized = PathUtils.normalize(path)
             val idx = normalized.lastIndexOf('/')
@@ -34,9 +27,6 @@ internal class VfsTree(
         }
 
         fun nowMillis(): Long = Clock.System.now().toEpochMilliseconds()
-
-        private var versionCounter: Long = 0
-        internal fun nextVersionId(): String = "v${++versionCounter}"
     }
 
     var root: DirNode = DirNode("/", nowMillis(), nowMillis(), FsPermissions.FULL)
@@ -169,10 +159,6 @@ internal class VfsTree(
     fun writeAt(node: FileNode, offset: Long, data: ByteArray): Result<Unit> {
         if (!node.permissions.canWrite()) return Result.failure(FsError.PermissionDenied(node.name))
         if (offset < 0) return Result.failure(FsError.InvalidPath("offset"))
-        // 写入前保存当前内容为历史版本
-        if (node.size > 0) {
-            saveVersion(node)
-        }
         node.blocks.write(offset.toInt(), data)
         node.modifiedAtMillis = nowMillis()
         return Result.success(Unit)
@@ -268,10 +254,7 @@ internal class VfsTree(
             name = node.name, type = node.type.name,
             createdAtMillis = node.createdAtMillis, modifiedAtMillis = node.modifiedAtMillis,
             permissions = SnapshotPermissions.from(node.permissions),
-            content = node.blocks.toByteArray(),
-            versions = if (node.versions.isEmpty()) null else node.versions.map { v ->
-                SnapshotVersionEntry(v.versionId, v.timestampMillis, v.data)
-            }
+            content = node.blocks.toByteArray()
         )
     }
 
@@ -290,10 +273,6 @@ internal class VfsTree(
                 val content = node.content ?: ByteArray(0)
                 if (content.isNotEmpty()) {
                     file.blocks.write(0, content)
-                }
-                // 恢复版本历史
-                node.versions?.forEach { v ->
-                    file.versions.add(VersionSnapshot(v.versionId, v.timestampMillis, v.data))
                 }
                 file
             }
@@ -353,65 +332,5 @@ internal class VfsTree(
         val node = resolveNode(normalized) ?: return
         node.permissions = permissions
         node.modifiedAtMillis = nowMillis()
-    }
-
-    // ── 版本管理 ─────────────────────────────────────────────────
-
-    /** 保存当前文件内容为历史版本。 */
-    internal fun saveVersion(node: FileNode) {
-        val snapshot = VersionSnapshot(
-            versionId = nextVersionId(),
-            timestampMillis = nowMillis(),
-            data = node.blocks.toByteArray()
-        )
-        node.versions.add(0, snapshot)
-        // 超出上限时移除最旧的版本
-        while (node.versions.size > maxVersions) {
-            node.versions.removeAt(node.versions.size - 1)
-        }
-    }
-
-    /** 获取文件的版本历史列表。 */
-    fun fileVersions(normalized: String): Result<List<FileVersion>> {
-        val node = resolveNodeOrError(normalized).getOrElse { return Result.failure(it) }
-        if (node !is FileNode) return Result.failure(FsError.NotFile(normalized))
-        if (!node.permissions.canRead()) return Result.failure(FsError.PermissionDenied(normalized))
-        return Result.success(
-            node.versions.map { v ->
-                FileVersion(
-                    versionId = v.versionId,
-                    timestampMillis = v.timestampMillis,
-                    size = v.data.size.toLong()
-                )
-            }
-        )
-    }
-
-    /** 读取某个历史版本的内容。 */
-    fun readVersion(normalized: String, versionId: String): Result<ByteArray> {
-        val node = resolveNodeOrError(normalized).getOrElse { return Result.failure(it) }
-        if (node !is FileNode) return Result.failure(FsError.NotFile(normalized))
-        if (!node.permissions.canRead()) return Result.failure(FsError.PermissionDenied(normalized))
-        val version = node.versions.find { it.versionId == versionId }
-            ?: return Result.failure(FsError.NotFound("version $versionId of $normalized"))
-        return Result.success(version.data.copyOf())
-    }
-
-    /** 恢复文件到某个历史版本（当前内容先保存为新版本）。 */
-    fun restoreVersion(normalized: String, versionId: String): Result<Unit> {
-        val node = resolveNodeOrError(normalized).getOrElse { return Result.failure(it) }
-        if (node !is FileNode) return Result.failure(FsError.NotFile(normalized))
-        if (!node.permissions.canWrite()) return Result.failure(FsError.PermissionDenied(normalized))
-        val version = node.versions.find { it.versionId == versionId }
-            ?: return Result.failure(FsError.NotFound("version $versionId of $normalized"))
-        // 保存当前内容为新版本
-        saveVersion(node)
-        // 用历史版本内容替换当前内容
-        node.blocks.clear()
-        if (version.data.isNotEmpty()) {
-            node.blocks.write(0, version.data)
-        }
-        node.modifiedAtMillis = nowMillis()
-        return Result.success(Unit)
     }
 }

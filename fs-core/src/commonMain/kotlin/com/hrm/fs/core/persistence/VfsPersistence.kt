@@ -11,6 +11,7 @@ internal data class PersistenceConfig(
     val snapshotKey: String = "vfs_snapshot.json",
     val walKey: String = "vfs_wal.json",
     val mountsKey: String = "vfs_mounts.json",
+    val versionsKey: String = "vfs_versions.json",
     val autoSnapshotEvery: Int = 20
 )
 
@@ -41,6 +42,12 @@ internal object VfsPersistenceCodec {
 
     fun decodeMounts(bytes: ByteArray): List<MountInfo> =
         json.decodeFromString(ListSerializer(MountInfo.serializer()), bytes.decodeToString())
+
+    fun encodeVersionData(data: SnapshotVersionData): ByteArray =
+        json.encodeToString(SnapshotVersionData.serializer(), data).encodeToByteArray()
+
+    fun decodeVersionData(bytes: ByteArray): SnapshotVersionData =
+        json.decodeFromString(SnapshotVersionData.serializer(), bytes.decodeToString())
 }
 
 @Serializable
@@ -75,6 +82,14 @@ internal data class SnapshotVersionEntry(
     val versionId: String,
     val timestampMillis: Long,
     val data: ByteArray
+)
+
+/**
+ * 按路径索引的版本历史快照。
+ */
+@Serializable
+internal data class SnapshotVersionData(
+    val entries: Map<String, List<SnapshotVersionEntry>> = emptyMap()
 )
 
 @Serializable

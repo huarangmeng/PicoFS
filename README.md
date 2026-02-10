@@ -77,7 +77,7 @@
   - **⬜ 压缩 / 解压**（zip/tar 归档操作）
   - **✅ 文件哈希 / 校验**（纯 Kotlin 实现 CRC32/SHA-256，`checksum()` API 支持内存文件与挂载点文件）
   - **⬜ 回收站**（软删除 + 恢复机制）
-  - **✅ 版本历史**（写入自动保存历史版本，`fileVersions()`/`readVersion()`/`restoreVersion()` API，快照持久化）
+  - **✅ 版本历史**（写入自动保存历史版本，`fileVersions()`/`readVersion()`/`restoreVersion()` API，支持内存文件与挂载点文件，独立持久化）
 
 ### 当前接口概览
 
