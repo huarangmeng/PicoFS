@@ -1,48 +1,120 @@
-This is a Kotlin Multiplatform project targeting Android, iOS, Desktop (JVM).
+## PicoFS（KMP）全虚拟文件系统（VFS）方案
 
-* [/composeApp](./composeApp/src) is for code that will be shared across your Compose Multiplatform applications.
-  It contains several subfolders:
-  - [commonMain](./composeApp/src/commonMain/kotlin) is for code that’s common for all targets.
-  - Other folders are for Kotlin code that will be compiled for only the platform indicated in the folder name.
-    For example, if you want to use Apple’s CoreCrypto for the iOS part of your Kotlin app,
-    the [iosMain](./composeApp/src/iosMain/kotlin) folder would be the right place for such calls.
-    Similarly, if you want to edit the Desktop (JVM) specific part, the [jvmMain](./composeApp/src/jvmMain/kotlin)
-    folder is the appropriate location.
+### 目标与边界
 
-* [/iosApp](./iosApp/iosApp) contains iOS applications. Even if you’re sharing your UI with Compose Multiplatform,
-  you need this entry point for your iOS app. This is also where you should add SwiftUI code for your project.
+- **目标**：在 Android / iOS / Desktop（JVM）上提供统一的“用户级虚拟文件系统”能力。
+- **边界**：**不进行系统级挂载**，不依赖 FUSE/WinFsp 等驱动。所有能力在应用内完成。
+- **优势**：核心逻辑使用 KMP 共享，平台侧只处理沙箱路径、权限与桥接。
 
-### Build and Run Android Application
+### 架构分层
 
-To build and run the development version of the Android app, use the run configuration from the run widget
-in your IDE’s toolbar or build it directly from the terminal:
-- on macOS/Linux
+- **`fs-api`**：对外接口与模型（`FileSystem`、`FileHandle`、`FsMeta` 等）。
+- **`fs-core`**：VFS 核心逻辑（目录树、元数据、读写与路径规范化）。
+- **`fs-platform`**：平台差异适配（平台识别、能力提示；后续可扩展沙箱路径策略）。
+
+###  VFS 应该具备的能力
+
+- **一致性优先**：跨平台语义一致（路径、错误码、权限），避免平台差异泄漏到业务层。
+- **可恢复性**：支持写前日志（WAL）或原子提交，保证断电/崩溃后不破坏结构。
+- **可扩展性**：目录树与元数据结构可扩展（属性、标签、权限位）。
+- **性能可控**：分层缓存（元数据缓存、读写缓冲）与可调策略。
+- **可观测性**：内置事件与日志，支持统计与调试（如操作耗时、命中率）。
+- **安全性**：路径规范化与权限校验统一化，避免越权访问。
+
+> 简单说：最好的 VFS 是“跨平台一致、可恢复、可扩展、可观测、性能可控”。
+
+### 能力清单与实现状态（VFS）
+
+- **基础能力**
+  - **✅ 路径规范化**（`/a/../b`、重复斜杠）
+  - **✅ 目录/文件创建与删除**
+  - **✅ 随机读写**（`readAt`/`writeAt`）
+  - **✅ 元数据查询**（大小、时间戳）
+  - **✅ 目录列举**
+- **权限与错误模型**
+  - **✅ 权限模型**（读/写/执行）
+  - **✅ 统一错误码**（NotFound/PermissionDenied 等）
+  - **⬜ 多用户/角色权限**（ACL/Owner/Group）
+- **一致性与恢复**
+  - **✅ WAL（写前日志）**
+  - **✅ 快照（Snapshot）**
+  - **⚠️ 崩溃恢复验证**（需平台存储适配）
+- **持久化存储**
+  - **⚠️ 抽象存储接口**（`FsStorage`）
+  - **⬜ 平台文件存储实现**（Android/iOS/JVM）
+- **可观测性**
+  - **⬜ 事件总线/统计**（IO 次数、耗时、命中率）
+- **性能与扩展**
+  - **⬜ 缓存策略**（热目录缓存、读写缓冲）
+  - **⬜ 大文件分块**（Block/Page）
+
+### 最小接口（示意）
+
+```kotlin
+interface FileSystem {
+    fun createFile(path: String): Result<Unit>
+    fun createDir(path: String): Result<Unit>
+    fun open(path: String, mode: OpenMode): Result<FileHandle>
+    fun readDir(path: String): Result<List<FsEntry>>
+    fun stat(path: String): Result<FsMeta>
+    fun delete(path: String): Result<Unit>
+    fun setPermissions(path: String, permissions: FsPermissions): Result<Unit>
+}
+```
+
+> 说明：该接口在 `commonMain` 中定义，平台侧通过 `expect/actual` 提供沙箱路径与能力适配；`FsMeta` 含权限信息。
+
+### 平台实现思路（VFS）
+
+- **Android**：使用应用沙箱目录（`context.filesDir` / `context.noBackupFilesDir`）。
+- **iOS**：使用 `Documents/` 或 `Application Support/`。
+- **Desktop (JVM)**：使用 `user.home` 下的应用目录。
+
+### 项目结构建议
+
+- **`fs-api`**
+  - `fs-api/src/commonMain/kotlin`：接口与模型
+- **`fs-core`**
+  - `fs/src/commonMain/kotlin`：VFS 核心逻辑
+  - 依赖 `fs-api` + `fs-platform`
+- **`fs-platform`**
+  - `fs-platform/src/*Main`：平台能力适配
+- **`composeApp`**
+  - UI 与业务调用层，依赖 `fs-core`
+
+### 开发与集成步骤
+
+1. 在 `fs-api` 定义接口与模型。
+2. 在 `fs-core` 实现 VFS 核心逻辑。
+3. 在 `fs-platform` 实现平台能力适配。
+4. `composeApp` 提供 UI + 操作入口（创建文件、列目录、读取/写入等）。
+
+---
+
+## Build and Run
+
+### Android
+
+- macOS/Linux
   ```shell
   ./gradlew :composeApp:assembleDebug
   ```
-- on Windows
+- Windows
   ```shell
   .\gradlew.bat :composeApp:assembleDebug
   ```
 
-### Build and Run Desktop (JVM) Application
+### Desktop (JVM)
 
-To build and run the development version of the desktop app, use the run configuration from the run widget
-in your IDE’s toolbar or run it directly from the terminal:
-- on macOS/Linux
+- macOS/Linux
   ```shell
   ./gradlew :composeApp:run
   ```
-- on Windows
+- Windows
   ```shell
   .\gradlew.bat :composeApp:run
   ```
 
-### Build and Run iOS Application
+### iOS
 
-To build and run the development version of the iOS app, use the run configuration from the run widget
-in your IDE’s toolbar or open the [/iosApp](./iosApp) directory in Xcode and run it from there.
-
----
-
-Learn more about [Kotlin Multiplatform](https://www.jetbrains.com/help/kotlin-multiplatform-dev/get-started.html)…
+打开 `iosApp` 目录，用 Xcode 运行。

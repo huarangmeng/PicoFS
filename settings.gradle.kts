@@ -34,4 +34,6 @@ plugins {
 
 include(":composeApp")
 include(":androidApp")
-include(":fs")
+include(":fs-core")
+include(":fs-api")
+include(":fs-platform")
