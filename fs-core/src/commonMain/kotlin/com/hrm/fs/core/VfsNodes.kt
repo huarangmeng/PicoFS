@@ -38,6 +38,15 @@ internal class FileNode(
         }
 }
 
+internal class SymlinkNode(
+    name: String,
+    createdAtMillis: Long,
+    modifiedAtMillis: Long,
+    permissions: FsPermissions,
+    /** 符号链接指向的目标路径（可以是绝对或相对路径）。 */
+    val targetPath: String
+) : VfsNode(name, FsType.SYMLINK, createdAtMillis, modifiedAtMillis, permissions)
+
 // ── 分块存储 ─────────────────────────────────────────────────
 
 /**

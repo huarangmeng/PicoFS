@@ -22,6 +22,9 @@ internal class VfsTree {
     companion object {
         private const val TAG = "VfsTree"
 
+        /** 符号链接解析的最大深度，防止循环引用。 */
+        private const val MAX_SYMLINK_DEPTH = 40
+
         fun splitParent(path: String): Pair<String, String> {
             val normalized = PathUtils.normalize(path)
             val idx = normalized.lastIndexOf('/')
@@ -37,20 +40,158 @@ internal class VfsTree {
 
     // ── 节点解析 ────────────────────────────────────────────────
 
-    fun resolveNode(path: String): VfsNode? {
+    /**
+     * 解析路径到节点，默认跟随符号链接。
+     *
+     * @param path 要解析的路径
+     * @param followSymlinks 是否跟随符号链接（默认 true）
+     * @return 解析到的节点，未找到返回 null
+     */
+    fun resolveNode(path: String, followSymlinks: Boolean = true): VfsNode? {
+        return resolveNodeInternal(path, followSymlinks, 0)
+    }
+
+    /**
+     * 内部递归解析，带深度计数防循环。
+     */
+    private fun resolveNodeInternal(path: String, followSymlinks: Boolean, depth: Int): VfsNode? {
+        if (depth > MAX_SYMLINK_DEPTH) return null
         if (path == "/") return root
         val parts = path.removePrefix("/").split("/").filter { it.isNotBlank() }
         var current: VfsNode = root
-        for (part in parts) {
+        var currentPath = ""
+        for ((index, part) in parts.withIndex()) {
+            // 如果当前节点是 symlink 且需要跟随，先解析 symlink
+            if (current is SymlinkNode && followSymlinks) {
+                val resolved = resolveSymlinkTarget(current, currentPath, depth + 1) ?: return null
+                current = resolved
+            }
             if (current !is DirNode) return null
-            current = current.children[part] ?: return null
+            val child = current.children[part] ?: return null
+            currentPath = if (currentPath.isEmpty()) "/$part" else "$currentPath/$part"
+            // 对于中间路径段的 symlink，总是跟随
+            if (child is SymlinkNode && followSymlinks && index < parts.size - 1) {
+                val resolved = resolveSymlinkTarget(child, currentPath, depth + 1) ?: return null
+                current = resolved
+            } else if (child is SymlinkNode && followSymlinks && index == parts.size - 1) {
+                // 最后一段也跟随
+                val resolved = resolveSymlinkTarget(child, currentPath, depth + 1) ?: return null
+                current = resolved
+            } else {
+                current = child
+            }
         }
         return current
+    }
+
+    /**
+     * 解析 symlink 节点指向的目标。
+     *
+     * @param symlink 符号链接节点
+     * @param symlinkPath 符号链接自身的绝对路径
+     * @param depth 当前递归深度
+     */
+    private fun resolveSymlinkTarget(symlink: SymlinkNode, symlinkPath: String, depth: Int): VfsNode? {
+        if (depth > MAX_SYMLINK_DEPTH) return null
+        val target = symlink.targetPath
+        val absoluteTarget = if (target.startsWith("/")) {
+            PathUtils.normalize(target)
+        } else {
+            // 相对路径：基于 symlink 所在目录解析
+            val parentDir = symlinkPath.substringBeforeLast('/', "/")
+            PathUtils.normalize("$parentDir/$target")
+        }
+        return resolveNodeInternal(absoluteTarget, followSymlinks = true, depth = depth)
+    }
+
+    /**
+     * 解析路径并返回解析后的绝对路径（跟随 symlink）。
+     * 用于需要知道最终路径的场景（如 stat 返回的路径）。
+     */
+    fun resolvePathFollowingSymlinks(path: String): String? {
+        return resolvePathInternal(path, 0)
+    }
+
+    private fun resolvePathInternal(path: String, depth: Int): String? {
+        if (depth > MAX_SYMLINK_DEPTH) return null
+        if (path == "/") return "/"
+        val parts = path.removePrefix("/").split("/").filter { it.isNotBlank() }
+        var current: VfsNode = root
+        var currentPath = ""
+        for ((index, part) in parts.withIndex()) {
+            if (current is SymlinkNode) {
+                val target = current.targetPath
+                val absoluteTarget = if (target.startsWith("/")) {
+                    PathUtils.normalize(target)
+                } else {
+                    val parentDir = currentPath.substringBeforeLast('/', "/")
+                    PathUtils.normalize("$parentDir/$target")
+                }
+                val resolvedPath = resolvePathInternal(absoluteTarget, depth + 1) ?: return null
+                val remaining = parts.drop(index).joinToString("/")
+                return resolvePathInternal("$resolvedPath/$remaining", depth + 1)
+            }
+            if (current !is DirNode) return null
+            val child = current.children[part] ?: return null
+            currentPath = if (currentPath.isEmpty()) "/$part" else "$currentPath/$part"
+            if (child is SymlinkNode && index < parts.size - 1) {
+                // 中间 symlink：解析并拼接剩余路径
+                val target = child.targetPath
+                val absoluteTarget = if (target.startsWith("/")) {
+                    PathUtils.normalize(target)
+                } else {
+                    val parentDir = currentPath.substringBeforeLast('/', "/")
+                    PathUtils.normalize("$parentDir/$target")
+                }
+                val resolvedPath = resolvePathInternal(absoluteTarget, depth + 1) ?: return null
+                val remaining = parts.drop(index + 1).joinToString("/")
+                return resolvePathInternal("$resolvedPath/$remaining", depth + 1)
+            }
+            current = child
+        }
+        // 最后一个节点如果是 symlink，不解析（返回 symlink 自身路径）
+        return currentPath.ifEmpty { "/" }
     }
 
     fun resolveNodeOrError(path: String): Result<VfsNode> {
         val node = resolveNode(path) ?: return Result.failure(FsError.NotFound(path))
         return Result.success(node)
+    }
+
+    /**
+     * 解析节点，不跟随最后一段的 symlink。返回错误时区分循环引用。
+     */
+    fun resolveNodeNoFollowOrError(path: String): Result<VfsNode> {
+        val node = resolveNodeNoFollow(path) ?: return Result.failure(FsError.NotFound(path))
+        return Result.success(node)
+    }
+
+    /**
+     * 解析路径到节点，不跟随最后一段的符号链接（但中间路径段的 symlink 仍会跟随）。
+     * 用于 readLink / delete symlink 等场景。
+     */
+    fun resolveNodeNoFollow(path: String): VfsNode? {
+        if (path == "/") return root
+        val parts = path.removePrefix("/").split("/").filter { it.isNotBlank() }
+        var current: VfsNode = root
+        var currentPath = ""
+        for ((index, part) in parts.withIndex()) {
+            if (current is SymlinkNode) {
+                val resolved = resolveSymlinkTarget(current, currentPath, 1) ?: return null
+                current = resolved
+            }
+            if (current !is DirNode) return null
+            val child = current.children[part] ?: return null
+            currentPath = if (currentPath.isEmpty()) "/$part" else "$currentPath/$part"
+            if (index < parts.size - 1 && child is SymlinkNode) {
+                // 中间路径段：跟随 symlink
+                val resolved = resolveSymlinkTarget(child, currentPath, 1) ?: return null
+                current = resolved
+            } else {
+                current = child
+            }
+        }
+        return current
     }
 
     fun resolveDirOrError(path: String): Result<DirNode> {
@@ -100,6 +241,28 @@ internal class VfsTree {
         return Result.success(Unit)
     }
 
+    fun createSymlink(normalized: String, targetPath: String): Result<Unit> {
+        val (parent, name) = splitParent(normalized)
+        val parentNode = resolveDirOrError(parent).getOrElse { return Result.failure(it) }
+        if (!parentNode.permissions.canWrite()) return Result.failure(
+            FsError.PermissionDenied(parent)
+        )
+        if (parentNode.children.containsKey(name)) return Result.failure(
+            FsError.AlreadyExists(normalized)
+        )
+        val now = nowMillis()
+        parentNode.children[name] = SymlinkNode(name, now, now, FsPermissions.FULL, targetPath)
+        parentNode.modifiedAtMillis = now
+        return Result.success(Unit)
+    }
+
+    fun readLink(normalized: String): Result<String> {
+        val node = resolveNodeNoFollow(normalized)
+            ?: return Result.failure(FsError.NotFound(normalized))
+        if (node !is SymlinkNode) return Result.failure(FsError.InvalidPath("非符号链接: $normalized"))
+        return Result.success(node.targetPath)
+    }
+
     // ── 删除 ──────────────────────────────────────────────────
     fun delete(normalized: String): Result<Unit> {
         if (normalized == "/") return Result.failure(FsError.PermissionDenied("/"))
@@ -132,12 +295,35 @@ internal class VfsTree {
         val node = resolveNodeOrError(normalized).getOrElse { return Result.failure(it) }
         if (!node.permissions.canRead()) return Result.failure(FsError.PermissionDenied(normalized))
         val size = if (node is FileNode) node.size.toLong() else 0L
+        val target = if (node is SymlinkNode) node.targetPath else null
         return Result.success(
             FsMeta(
                 path = normalized, type = node.type, size = size,
                 createdAtMillis = node.createdAtMillis,
                 modifiedAtMillis = node.modifiedAtMillis,
-                permissions = node.permissions
+                permissions = node.permissions,
+                target = target
+            )
+        )
+    }
+
+    /**
+     * stat 不跟随 symlink（lstat 语义）。
+     * 当路径本身是 symlink 时，返回 symlink 自身的元数据。
+     */
+    fun lstat(normalized: String): Result<FsMeta> {
+        val node = resolveNodeNoFollow(normalized)
+            ?: return Result.failure(FsError.NotFound(normalized))
+        if (!node.permissions.canRead()) return Result.failure(FsError.PermissionDenied(normalized))
+        val size = if (node is FileNode) node.size.toLong() else 0L
+        val target = if (node is SymlinkNode) node.targetPath else null
+        return Result.success(
+            FsMeta(
+                path = normalized, type = node.type, size = size,
+                createdAtMillis = node.createdAtMillis,
+                modifiedAtMillis = node.modifiedAtMillis,
+                permissions = node.permissions,
+                target = target
             )
         )
     }
@@ -176,6 +362,7 @@ internal class VfsTree {
             when (node) {
                 is FileNode -> total += node.size
                 is DirNode -> node.children.values.forEach { walk(it) }
+                is SymlinkNode -> { /* symlink 不占用文件内容空间 */ }
             }
         }
         walk(root)
@@ -235,6 +422,7 @@ internal class VfsTree {
             when (entry) {
                 is WalEntry.CreateFile -> createFileInternal(entry.path)
                 is WalEntry.CreateDir -> createDirInternal(entry.path)
+                is WalEntry.CreateSymlink -> createSymlinkInternal(entry.path, entry.target)
                 is WalEntry.Delete -> deleteInternal(entry.path)
                 is WalEntry.Write -> writeInternal(entry.path, entry.offset, entry.data)
                 is WalEntry.SetPermissions -> setPermissionsInternal(
@@ -261,25 +449,41 @@ internal class VfsTree {
             permissions = SnapshotPermissions.from(node.permissions),
             content = node.blocks.toByteArray()
         )
+
+        is SymlinkNode -> SnapshotNode(
+            name = node.name, type = node.type.name,
+            createdAtMillis = node.createdAtMillis, modifiedAtMillis = node.modifiedAtMillis,
+            permissions = SnapshotPermissions.from(node.permissions),
+            target = node.targetPath
+        )
     }
 
     private fun buildFromSnapshot(snapshot: SnapshotNode): DirNode {
         fun build(node: SnapshotNode): VfsNode {
             val perms = node.permissions.toFsPermissions()
-            return if (node.fsType() == FsType.DIRECTORY) {
-                val dir = DirNode(node.name, node.createdAtMillis, node.modifiedAtMillis, perms)
-                node.children.orEmpty().forEach { child ->
-                    val childNode = build(child)
-                    dir.children[childNode.name] = childNode
+            return when (node.fsType()) {
+                FsType.DIRECTORY -> {
+                    val dir = DirNode(node.name, node.createdAtMillis, node.modifiedAtMillis, perms)
+                    node.children.orEmpty().forEach { child ->
+                        val childNode = build(child)
+                        dir.children[childNode.name] = childNode
+                    }
+                    dir
                 }
-                dir
-            } else {
-                val file = FileNode(node.name, node.createdAtMillis, node.modifiedAtMillis, perms)
-                val content = node.content ?: ByteArray(0)
-                if (content.isNotEmpty()) {
-                    file.blocks.write(0, content)
+                FsType.SYMLINK -> {
+                    SymlinkNode(
+                        node.name, node.createdAtMillis, node.modifiedAtMillis, perms,
+                        node.target ?: ""
+                    )
                 }
-                file
+                FsType.FILE -> {
+                    val file = FileNode(node.name, node.createdAtMillis, node.modifiedAtMillis, perms)
+                    val content = node.content ?: ByteArray(0)
+                    if (content.isNotEmpty()) {
+                        file.blocks.write(0, content)
+                    }
+                    file
+                }
             }
         }
 
@@ -310,6 +514,16 @@ internal class VfsTree {
         if (parentNode.children.containsKey(name)) return
         val now = nowMillis()
         parentNode.children[name] = DirNode(name, now, now, FsPermissions.FULL)
+        parentNode.modifiedAtMillis = now
+    }
+
+    private fun createSymlinkInternal(path: String, target: String) {
+        val normalized = PathUtils.normalize(path)
+        val (parent, name) = splitParent(normalized)
+        val parentNode = resolveNode(parent) as? DirNode ?: return
+        if (parentNode.children.containsKey(name)) return
+        val now = nowMillis()
+        parentNode.children[name] = SymlinkNode(name, now, now, FsPermissions.FULL, target)
         parentNode.modifiedAtMillis = now
     }
 

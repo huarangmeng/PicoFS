@@ -48,9 +48,9 @@
 - **一致性与恢复**
   - **✅ WAL（写前日志）**（5 种操作类型，自动回放）
   - **✅ 快照（Snapshot）**（自动快照，每 20 次操作触发）
-  - **⚠️ 崩溃恢复验证**（需平台存储适配 + 断电场景测试）
-  - **⬜ WAL 原子写入保证**（当前 JSON 序列化非原子）
-  - **⬜ 损坏 WAL/Snapshot 容错处理**
+  - **✅ 崩溃恢复验证**（CRC32 完整性校验 + 断电场景测试覆盖）
+  - **✅ WAL 原子写入保证**（CRC32 包装 + 平台层 tmp+rename 原子写入）
+  - **✅ 损坏 WAL/Snapshot 容错处理**（独立降级：snapshot 损坏回退 WAL、WAL 损坏回退 snapshot、均损坏从空树启动）
 - **持久化存储**
   - **✅ 抽象存储接口**（`FsStorage`）
   - **✅ 内存存储实现**（`InMemoryFsStorage`）
@@ -70,7 +70,7 @@
   - **✅ 大文件分块**（BlockStorage 64KB 分块，按需分配，避免单一 ByteArray 占用连续大内存）
   - **✅ 磁盘空间配额**（`quotaBytes` 参数限制虚拟磁盘容量，`quotaInfo()` API 查询用量）
 - **高级功能**
-  - **⬜ 符号链接**（symlink / hardlink）
+  - **✅ 符号链接**（symlink，创建/读取/透明跟随/链式解析/相对路径/持久化）
   - **✅ 文件锁**（flock，文件级并发控制，共享锁/独占锁/锁升级/挂起等待）
   - **⬜ 搜索 / 查找**（按文件名/内容搜索，类 find/grep）
   - **⬜ 文件扩展属性**（xattr / 自定义标签）
@@ -95,6 +95,10 @@ interface FileSystem {
     // 递归操作
     suspend fun createDirRecursive(path: String): Result<Unit>
     suspend fun deleteRecursive(path: String): Result<Unit>
+
+    // 符号链接
+    suspend fun createSymlink(linkPath: String, targetPath: String): Result<Unit>
+    suspend fun readLink(path: String): Result<String>
 
     // 便捷读写
     suspend fun readAll(path: String): Result<ByteArray>

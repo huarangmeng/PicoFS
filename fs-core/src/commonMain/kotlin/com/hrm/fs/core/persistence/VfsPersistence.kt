@@ -25,30 +25,84 @@ internal data class MountInfo(
 internal object VfsPersistenceCodec {
     private val json = Json { encodeDefaults = true; ignoreUnknownKeys = true }
 
+    /** CRC32 校验头标记，用于检测数据完整性。 */
+    private const val CRC_HEADER = "CRC:"
+
     fun encodeSnapshot(snapshot: SnapshotNode): ByteArray =
-        json.encodeToString(SnapshotNode.serializer(), snapshot).encodeToByteArray()
+        wrapWithCrc(json.encodeToString(SnapshotNode.serializer(), snapshot))
 
     fun decodeSnapshot(bytes: ByteArray): SnapshotNode =
-        json.decodeFromString(SnapshotNode.serializer(), bytes.decodeToString())
+        json.decodeFromString(SnapshotNode.serializer(), unwrapCrc(bytes))
 
     fun encodeWal(entries: List<WalEntry>): ByteArray =
-        json.encodeToString(ListSerializer(WalEntry.serializer()), entries).encodeToByteArray()
+        wrapWithCrc(json.encodeToString(ListSerializer(WalEntry.serializer()), entries))
 
     fun decodeWal(bytes: ByteArray): List<WalEntry> =
-        json.decodeFromString(ListSerializer(WalEntry.serializer()), bytes.decodeToString())
+        json.decodeFromString(ListSerializer(WalEntry.serializer()), unwrapCrc(bytes))
 
     fun encodeMounts(mounts: List<MountInfo>): ByteArray =
-        json.encodeToString(ListSerializer(MountInfo.serializer()), mounts).encodeToByteArray()
+        wrapWithCrc(json.encodeToString(ListSerializer(MountInfo.serializer()), mounts))
 
     fun decodeMounts(bytes: ByteArray): List<MountInfo> =
-        json.decodeFromString(ListSerializer(MountInfo.serializer()), bytes.decodeToString())
+        json.decodeFromString(ListSerializer(MountInfo.serializer()), unwrapCrc(bytes))
 
     fun encodeVersionData(data: SnapshotVersionData): ByteArray =
-        json.encodeToString(SnapshotVersionData.serializer(), data).encodeToByteArray()
+        wrapWithCrc(json.encodeToString(SnapshotVersionData.serializer(), data))
 
     fun decodeVersionData(bytes: ByteArray): SnapshotVersionData =
-        json.decodeFromString(SnapshotVersionData.serializer(), bytes.decodeToString())
+        json.decodeFromString(SnapshotVersionData.serializer(), unwrapCrc(bytes))
+
+    /**
+     * 将 JSON 字符串打包为 "CRC:<hex8>\n<json>" 格式的字节数组。
+     * 写入时附带 CRC32 校验值，读取时验证完整性。
+     */
+    private fun wrapWithCrc(jsonString: String): ByteArray {
+        val crc = crc32(jsonString.encodeToByteArray())
+        return "$CRC_HEADER$crc\n$jsonString".encodeToByteArray()
+    }
+
+    /**
+     * 从 "CRC:<hex8>\n<json>" 格式的字节数组中解包 JSON 字符串。
+     * 缺少 CRC 头或校验失败时抛出 [CorruptedDataException]。
+     */
+    internal fun unwrapCrc(bytes: ByteArray): String {
+        val text = bytes.decodeToString()
+        if (!text.startsWith(CRC_HEADER)) {
+            throw CorruptedDataException("Missing CRC header")
+        }
+        val newlineIndex = text.indexOf('\n')
+        if (newlineIndex < 0) throw CorruptedDataException("CRC header without payload")
+        val expectedCrc = text.substring(CRC_HEADER.length, newlineIndex)
+        val jsonPayload = text.substring(newlineIndex + 1)
+        val actualCrc = crc32(jsonPayload.encodeToByteArray())
+        if (expectedCrc != actualCrc) {
+            throw CorruptedDataException("CRC mismatch: expected=$expectedCrc, actual=$actualCrc")
+        }
+        return jsonPayload
+    }
+
+    /**
+     * 简单 CRC32 实现（与 VfsChecksum 独立，避免循环依赖）。
+     * 返回 8 位小写十六进制字符串。
+     */
+    private fun crc32(data: ByteArray): String {
+        var crc = 0xFFFFFFFF.toInt()
+        for (byte in data) {
+            crc = crc xor (byte.toInt() and 0xFF)
+            repeat(8) {
+                crc = if (crc and 1 != 0) (crc ushr 1) xor 0xEDB88320.toInt()
+                else crc ushr 1
+            }
+        }
+        return (crc xor 0xFFFFFFFF.toInt()).toUInt().toString(16).padStart(8, '0')
+    }
 }
+
+/**
+ * 持久化数据损坏异常。
+ * 加载时检测到 CRC 校验失败或数据格式错误时抛出。
+ */
+internal class CorruptedDataException(message: String) : Exception(message)
 
 @Serializable
 internal data class SnapshotPermissions(
@@ -72,9 +126,15 @@ internal data class SnapshotNode(
     val permissions: SnapshotPermissions,
     val content: ByteArray? = null,
     val children: List<SnapshotNode>? = null,
-    val versions: List<SnapshotVersionEntry>? = null
+    val versions: List<SnapshotVersionEntry>? = null,
+    /** 符号链接目标路径，仅 type == "SYMLINK" 时有值。 */
+    val target: String? = null
 ) {
-    fun fsType(): FsType = if (type == "DIRECTORY") FsType.DIRECTORY else FsType.FILE
+    fun fsType(): FsType = when (type) {
+        "DIRECTORY" -> FsType.DIRECTORY
+        "SYMLINK" -> FsType.SYMLINK
+        else -> FsType.FILE
+    }
 }
 
 @Serializable
@@ -101,6 +161,10 @@ internal sealed class WalEntry {
     @Serializable
     @SerialName("CreateDir")
     data class CreateDir(val path: String) : WalEntry()
+
+    @Serializable
+    @SerialName("CreateSymlink")
+    data class CreateSymlink(val path: String, val target: String) : WalEntry()
 
     @Serializable
     @SerialName("Delete")

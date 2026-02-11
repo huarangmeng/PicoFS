@@ -531,6 +531,42 @@ internal class InMemoryFileSystem(
     }
 
     // ═══════════════════════════════════════════════════════════
+    // 符号链接
+    // ═══════════════════════════════════════════════════════════
+
+    override suspend fun createSymlink(linkPath: String, targetPath: String): Result<Unit> {
+        FLog.d(TAG, "createSymlink: linkPath=$linkPath, targetPath=$targetPath")
+        val result = locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(linkPath)
+            // 符号链接不能在挂载点内创建（挂载点使用真实文件系统）
+            val match = mountTable.findMount(normalized)
+            if (match != null) {
+                FLog.w(TAG, "createSymlink failed: cannot create symlink in mount point $normalized")
+                return@locked Result.failure(FsError.PermissionDenied("挂载点内不支持符号链接: $normalized"))
+            }
+            tree.createSymlink(normalized, targetPath).also { r ->
+                if (r.isSuccess) {
+                    walAppend(WalEntry.CreateSymlink(normalized, targetPath))
+                    eventBus.emit(normalized, FsEventKind.CREATED)
+                } else {
+                    FLog.w(TAG, "createSymlink failed: $normalized -> $targetPath, error=${r.exceptionOrNull()}")
+                }
+            }
+        }
+        return result
+    }
+
+    override suspend fun readLink(path: String): Result<String> {
+        FLog.d(TAG, "readLink: path=$path")
+        return locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            tree.readLink(normalized)
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
     // 递归操作
     // ═══════════════════════════════════════════════════════════
 
@@ -558,6 +594,9 @@ internal class InMemoryFileSystem(
             return Result.failure(FsError.PermissionDenied("不能删除挂载点: $normalized"))
         }
         val meta = stat(normalized).getOrElse { return Result.failure(it) }
+        // 符号链接直接删除（不跟随到目标）
+        val lmeta = locked { tree.lstat(normalized) }.getOrNull()
+        if (lmeta != null && lmeta.type == FsType.SYMLINK) return delete(normalized)
         if (meta.type == FsType.FILE) return delete(normalized)
         val entries = readDir(normalized).getOrElse { return Result.failure(it) }
         for (entry in entries) {

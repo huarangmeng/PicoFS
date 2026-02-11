@@ -2,7 +2,7 @@ package com.hrm.fs.api
 
 import kotlinx.coroutines.flow.Flow
 
-enum class FsType { FILE, DIRECTORY }
+enum class FsType { FILE, DIRECTORY, SYMLINK }
 
 enum class OpenMode { READ, WRITE, READ_WRITE }
 
@@ -20,6 +20,7 @@ enum class FsErrorCode {
     NOT_MOUNTED,
     LOCKED,
     QUOTA_EXCEEDED,
+    SYMLINK_LOOP,
     UNKNOWN
 }
 
@@ -44,7 +45,9 @@ data class FsMeta(
     val size: Long,
     val createdAtMillis: Long,
     val modifiedAtMillis: Long,
-    val permissions: FsPermissions
+    val permissions: FsPermissions,
+    /** 符号链接的目标路径，仅当 [type] 为 [FsType.SYMLINK] 时有值。 */
+    val target: String? = null
 )
 
 data class FsEntry(
@@ -146,6 +149,30 @@ interface FileSystem {
 
     /** 递归删除目录及其所有内容（类似 rm -rf）。 */
     suspend fun deleteRecursive(path: String): Result<Unit>
+
+    // ─── 符号链接 ────────────────────────────────────────────
+
+    /**
+     * 创建符号链接。
+     *
+     * 在 [linkPath] 处创建一个指向 [targetPath] 的符号链接。
+     * [targetPath] 可以是绝对路径或相对路径（相对于 linkPath 所在目录）。
+     * 创建时不验证目标是否存在（允许悬空链接）。
+     *
+     * @param linkPath 符号链接的虚拟路径
+     * @param targetPath 链接指向的目标路径
+     */
+    suspend fun createSymlink(linkPath: String, targetPath: String): Result<Unit>
+
+    /**
+     * 读取符号链接的目标路径。
+     *
+     * 返回符号链接指向的原始目标路径（不解析）。
+     *
+     * @param path 符号链接的虚拟路径
+     * @return 链接目标路径
+     */
+    suspend fun readLink(path: String): Result<String>
 
     // ─── 便捷读写 ────────────────────────────────────────────
 
@@ -496,5 +523,6 @@ sealed class FsError(message: String, val code: FsErrorCode) : Exception(message
     class NotMounted(path: String) : FsError("未挂载: $path", FsErrorCode.NOT_MOUNTED)
     class Locked(path: String) : FsError("文件已被锁定: $path", FsErrorCode.LOCKED)
     class QuotaExceeded(message: String) : FsError(message, FsErrorCode.QUOTA_EXCEEDED)
+    class SymlinkLoop(path: String) : FsError("符号链接循环: $path", FsErrorCode.SYMLINK_LOOP)
     class Unknown(message: String) : FsError(message, FsErrorCode.UNKNOWN)
 }
