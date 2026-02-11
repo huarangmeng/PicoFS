@@ -9,6 +9,7 @@ import com.hrm.fs.api.FsEventKind
 import com.hrm.fs.api.FsMeta
 import com.hrm.fs.api.FsPermissions
 import com.hrm.fs.api.FsType
+import com.hrm.fs.api.log.FLog
 import kotlinx.cinterop.BetaInteropApi
 import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.addressOf
@@ -40,6 +41,11 @@ import kotlin.concurrent.Volatile
 actual fun createDiskFileOperations(rootPath: String): DiskFileOperations = IosDiskFileOperations(rootPath)
 
 internal class IosDiskFileOperations(override val rootPath: String) : DiskFileOperations, DiskFileWatcher {
+
+    companion object {
+        private const val TAG = "IosDiskOps"
+    }
+
     private val fm = NSFileManager.defaultManager
 
     private fun resolve(path: String): String {

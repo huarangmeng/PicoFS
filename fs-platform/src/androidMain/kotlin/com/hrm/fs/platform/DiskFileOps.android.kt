@@ -10,6 +10,7 @@ import com.hrm.fs.api.FsEventKind
 import com.hrm.fs.api.FsMeta
 import com.hrm.fs.api.FsPermissions
 import com.hrm.fs.api.FsType
+import com.hrm.fs.api.log.FLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
@@ -35,6 +36,10 @@ actual fun createDiskFileOperations(rootPath: String): DiskFileOperations =
 
 internal class AndroidDiskFileOperations(override val rootPath: String) : DiskFileOperations,
     DiskFileWatcher {
+
+    companion object {
+        private const val TAG = "AndroidDiskOps"
+    }
 
     private fun resolve(path: String): File {
         val rel = path.removePrefix("/")
@@ -196,7 +201,8 @@ internal class AndroidDiskFileOperations(override val rootPath: String) : DiskFi
                         StandardWatchEventKinds.ENTRY_DELETE
                     )
                     keyToPath[key] = dir
-                } catch (_: Exception) {
+                } catch (e: Exception) {
+                    FLog.w(TAG, "registerDir failed: $dir: ${e.message}")
                 }
             }
 

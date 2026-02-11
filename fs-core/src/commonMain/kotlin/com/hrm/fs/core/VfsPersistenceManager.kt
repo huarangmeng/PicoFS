@@ -1,6 +1,7 @@
 package com.hrm.fs.core
 
 import com.hrm.fs.api.FsStorage
+import com.hrm.fs.api.log.FLog
 import com.hrm.fs.core.persistence.MountInfo
 import com.hrm.fs.core.persistence.PersistenceConfig
 import com.hrm.fs.core.persistence.SnapshotNode
@@ -18,6 +19,10 @@ internal class VfsPersistenceManager(
     private val storage: FsStorage?,
     private val config: PersistenceConfig = PersistenceConfig()
 ) {
+    companion object {
+        private const val TAG = "VfsPersistence"
+    }
+
     private val walEntries: MutableList<WalEntry> = mutableListOf()
     private var opsSinceSnapshot: Int = 0
     private var loaded: Boolean = false
@@ -45,6 +50,7 @@ internal class VfsPersistenceManager(
 
     private suspend fun load(): LoadResult? {
         if (storage == null) return null
+        FLog.d(TAG, "load: reading from storage")
 
         val snapshot = storage.read(config.snapshotKey).getOrNull()?.let {
             VfsPersistenceCodec.decodeSnapshot(it)
@@ -67,6 +73,7 @@ internal class VfsPersistenceManager(
             VfsPersistenceCodec.decodeVersionData(it)
         }
 
+        FLog.i(TAG, "load completed: snapshot=${snapshot != null}, walEntries=${wal.size}, mounts=${mountInfos.size}, versions=${versionData?.entries?.size ?: 0}")
         return LoadResult(snapshot, wal, mountInfos, versionData)
     }
 
@@ -88,13 +95,16 @@ internal class VfsPersistenceManager(
         walEntries.add(entry)
         opsSinceSnapshot++
         storage.write(config.walKey, VfsPersistenceCodec.encodeWal(walEntries))
+        FLog.v(TAG, "appendWal: opsSinceSnapshot=$opsSinceSnapshot, entry=$entry")
         if (opsSinceSnapshot >= config.autoSnapshotEvery) {
+            FLog.d(TAG, "appendWal: auto snapshot triggered at $opsSinceSnapshot ops")
             saveSnapshot(snapshotProvider(), versionDataProvider())
         }
     }
 
     suspend fun saveSnapshot(snapshot: SnapshotNode, versionData: SnapshotVersionData? = null) {
         if (storage == null) return
+        FLog.d(TAG, "saveSnapshot: saving snapshot and clearing WAL")
         storage.write(config.snapshotKey, VfsPersistenceCodec.encodeSnapshot(snapshot))
         if (versionData != null) {
             storage.write(config.versionsKey, VfsPersistenceCodec.encodeVersionData(versionData))

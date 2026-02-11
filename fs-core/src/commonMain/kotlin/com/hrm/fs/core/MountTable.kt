@@ -3,6 +3,7 @@ package com.hrm.fs.core
 import com.hrm.fs.api.DiskFileOperations
 import com.hrm.fs.api.FsError
 import com.hrm.fs.api.MountOptions
+import com.hrm.fs.api.log.FLog
 import com.hrm.fs.core.persistence.MountInfo
 
 /**
@@ -14,6 +15,10 @@ import com.hrm.fs.core.persistence.MountInfo
  * **无线程安全保证**，外部需自行加锁。
  */
 internal class MountTable {
+
+    companion object {
+        private const val TAG = "MountTable"
+    }
 
     /** 活跃挂载：虚拟路径 -> (DiskFileOperations, MountOptions) */
     private val active: MutableMap<String, Pair<DiskFileOperations, MountOptions>> = LinkedHashMap()
@@ -28,16 +33,22 @@ internal class MountTable {
     // ── 挂载 / 卸载 ─────────────────────────────────────────
 
     fun mount(normalizedPath: String, diskOps: DiskFileOperations, options: MountOptions): Result<Unit> {
-        if (normalizedPath == "/") return Result.failure(FsError.InvalidPath("不能挂载根路径"))
+        if (normalizedPath == "/") {
+            FLog.w(TAG, "mount failed: cannot mount root path")
+            return Result.failure(FsError.InvalidPath("不能挂载根路径"))
+        }
         active[normalizedPath] = diskOps to options
         pending.remove(normalizedPath)
+        FLog.d(TAG, "mount: $normalizedPath -> ${diskOps.rootPath}")
         return Result.success(Unit)
     }
 
     fun unmount(normalizedPath: String): Result<Unit> {
         if (active.remove(normalizedPath) == null) {
+            FLog.w(TAG, "unmount failed: not mounted $normalizedPath")
             return Result.failure(FsError.NotMounted(normalizedPath))
         }
+        FLog.d(TAG, "unmount: $normalizedPath")
         return Result.success(Unit)
     }
 
@@ -83,6 +94,7 @@ internal class MountTable {
             if (active.containsKey(info.virtualPath)) continue
             pending[info.virtualPath] = info
         }
+        FLog.d(TAG, "restoreFromPersistence: ${mountInfos.size} entries, pending=${pending.size}")
     }
 
     /**

@@ -2,6 +2,7 @@ package com.hrm.fs.core
 
 import com.hrm.fs.api.FileLockType
 import com.hrm.fs.api.FsError
+import com.hrm.fs.api.log.FLog
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -17,6 +18,10 @@ import kotlinx.coroutines.sync.withLock
  * 调用方应在全局 Mutex **外部**调用 [lock]，避免死锁。
  */
 internal class VfsFileLockManager {
+
+    companion object {
+        private const val TAG = "VfsLock"
+    }
 
     private val mutex = Mutex()
 
@@ -56,8 +61,10 @@ internal class VfsFileLockManager {
             releaseLockInternal(path, handleId)
             return if (canAcquire(path, handleId, type)) {
                 acquireInternal(path, handleId, type)
+                FLog.d(TAG, "tryLock success: path=$path, handleId=$handleId, type=$type")
                 Result.success(Unit)
             } else {
+                FLog.d(TAG, "tryLock failed: path=$path, handleId=$handleId, type=$type (locked)")
                 Result.failure(FsError.Locked(path))
             }
         }
@@ -71,6 +78,7 @@ internal class VfsFileLockManager {
      * @param type 锁类型
      */
     suspend fun lock(path: String, handleId: Long, type: FileLockType): Result<Unit> {
+        FLog.d(TAG, "lock: path=$path, handleId=$handleId, type=$type")
         // 先尝试一次
         mutex.withLock {
             releaseLockInternal(path, handleId)
@@ -114,6 +122,7 @@ internal class VfsFileLockManager {
             releaseLockInternal(path, handleId)
             notifyWaiters(path)
         }
+        FLog.d(TAG, "unlock: path=$path, handleId=$handleId")
         return Result.success(Unit)
     }
 
@@ -215,8 +224,8 @@ internal class VfsFileLockManager {
         for (waiter in list) {
             try {
                 waiter.unlock()
-            } catch (_: IllegalStateException) {
-                // 已被取消的等待者，忽略
+            } catch (e: IllegalStateException) {
+                FLog.d(TAG, "notifyWaiters: waiter already cancelled for path=$path")
             }
         }
     }

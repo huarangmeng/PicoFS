@@ -9,6 +9,7 @@ import com.hrm.fs.api.FsEventKind
 import com.hrm.fs.api.FsMeta
 import com.hrm.fs.api.FsPermissions
 import com.hrm.fs.api.FsType
+import com.hrm.fs.api.log.FLog
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
@@ -33,6 +34,10 @@ import java.util.concurrent.TimeUnit
 actual fun createDiskFileOperations(rootPath: String): DiskFileOperations = JvmDiskFileOperations(rootPath)
 
 internal class JvmDiskFileOperations(override val rootPath: String) : DiskFileOperations, DiskFileWatcher {
+
+    companion object {
+        private const val TAG = "JvmDiskOps"
+    }
 
     private fun resolve(path: String): File {
         val rel = path.removePrefix("/")
@@ -169,8 +174,8 @@ internal class JvmDiskFileOperations(override val rootPath: String) : DiskFileOp
                     StandardWatchEventKinds.ENTRY_DELETE
                 )
                 keyToPath[key] = dir
-            } catch (_: Exception) {
-                // 目录可能已被删除或无权限，忽略
+            } catch (e: Exception) {
+                FLog.w(TAG, "registerDir failed: $dir: ${e.message}")
             }
         }
 

@@ -2,6 +2,7 @@ package com.hrm.fs.core
 
 import com.hrm.fs.api.FileVersion
 import com.hrm.fs.api.FsError
+import com.hrm.fs.api.log.FLog
 import com.hrm.fs.core.persistence.SnapshotVersionData
 import com.hrm.fs.core.persistence.SnapshotVersionEntry
 import kotlin.time.Clock
@@ -18,6 +19,7 @@ internal class VfsVersionManager(
 ) {
     companion object {
         const val DEFAULT_MAX_VERSIONS = 10
+        private const val TAG = "VfsVersion"
 
         private var versionCounter: Long = 0
         internal fun nextVersionId(): String = "v${++versionCounter}"
@@ -45,6 +47,7 @@ internal class VfsVersionManager(
         while (versions.size > maxVersions) {
             versions.removeAt(versions.size - 1)
         }
+        FLog.d(TAG, "saveVersion: path=$path, versionId=${snapshot.versionId}, size=${data.size}, total=${versions.size}")
     }
 
     /** 获取文件的版本历史列表。 */
@@ -61,9 +64,13 @@ internal class VfsVersionManager(
 
     /** 读取某个历史版本的内容。 */
     fun readVersion(path: String, versionId: String): Result<ByteArray> {
-        val versions = store[path] ?: return Result.failure(FsError.NotFound("version $versionId of $path"))
+        val versions = store[path] ?: return Result.failure(FsError.NotFound("version $versionId of $path").also {
+            FLog.w(TAG, "readVersion: no versions for path=$path")
+        })
         val version = versions.find { it.versionId == versionId }
-            ?: return Result.failure(FsError.NotFound("version $versionId of $path"))
+            ?: return Result.failure(FsError.NotFound("version $versionId of $path").also {
+                FLog.w(TAG, "readVersion: versionId=$versionId not found for path=$path")
+            })
         return Result.success(version.data.copyOf())
     }
 
@@ -76,11 +83,16 @@ internal class VfsVersionManager(
      * @return 历史版本的完整内容
      */
     fun restoreVersion(path: String, versionId: String, currentData: ByteArray): Result<ByteArray> {
-        val versions = store[path] ?: return Result.failure(FsError.NotFound("version $versionId of $path"))
+        val versions = store[path] ?: return Result.failure(FsError.NotFound("version $versionId of $path").also {
+            FLog.w(TAG, "restoreVersion: no versions for path=$path")
+        })
         val version = versions.find { it.versionId == versionId }
-            ?: return Result.failure(FsError.NotFound("version $versionId of $path"))
+            ?: return Result.failure(FsError.NotFound("version $versionId of $path").also {
+                FLog.w(TAG, "restoreVersion: versionId=$versionId not found for path=$path")
+            })
         // 保存当前内容为新版本
         saveVersion(path, currentData)
+        FLog.i(TAG, "restoreVersion: path=$path, restored to versionId=$versionId")
         return Result.success(version.data.copyOf())
     }
 
@@ -121,6 +133,7 @@ internal class VfsVersionManager(
                 VersionSnapshot(e.versionId, e.timestampMillis, e.data)
             }.toMutableList()
         }
+        FLog.d(TAG, "restoreFromSnapshot: restored ${data.size} files' version data")
     }
 
     /** 是否有版本数据。 */

@@ -20,6 +20,7 @@ import com.hrm.fs.api.OpenMode
 import com.hrm.fs.api.PathUtils
 import com.hrm.fs.api.PendingMount
 import com.hrm.fs.api.QuotaInfo
+import com.hrm.fs.api.log.FLog
 import com.hrm.fs.core.VfsMetricsCollector.Op
 import com.hrm.fs.core.persistence.PersistenceConfig
 import com.hrm.fs.core.persistence.SnapshotPermissions
@@ -50,6 +51,10 @@ internal class InMemoryFileSystem(
     /** 虚拟磁盘空间配额（字节），-1 表示无限制。仅约束内存文件树。 */
     private val quotaBytes: Long = -1
 ) : FileSystem {
+
+    companion object {
+        private const val TAG = "InMemoryFS"
+    }
 
     private val mutex = Mutex()
     private val tree = VfsTree()
@@ -94,8 +99,12 @@ internal class InMemoryFileSystem(
         locked {
             ensureLoaded()
             val normalized = PathUtils.normalize(path)
+            FLog.d(TAG, "checksum: path=$normalized, algorithm=$algorithm")
             // 读取完整文件内容
-            val data = readAllBytes(normalized).getOrElse { return@locked Result.failure(it) }
+            val data = readAllBytes(normalized).getOrElse {
+                FLog.w(TAG, "checksum failed: cannot read $normalized: $it")
+                return@locked Result.failure(it)
+            }
             val hash = when (algorithm) {
                 ChecksumAlgorithm.CRC32 -> VfsChecksum.crc32(data)
                 ChecksumAlgorithm.SHA256 -> VfsChecksum.sha256(data)
@@ -140,22 +149,34 @@ internal class InMemoryFileSystem(
     override suspend fun restoreVersion(path: String, versionId: String): Result<Unit> = locked {
         ensureLoaded()
         val normalized = PathUtils.normalize(path)
+        FLog.d(TAG, "restoreVersion: path=$normalized, versionId=$versionId")
         // 读取当前内容
-        val currentData = readAllBytes(normalized).getOrElse { return@locked Result.failure(it) }
+        val currentData = readAllBytes(normalized).getOrElse {
+            FLog.w(TAG, "restoreVersion failed: cannot read current $normalized: $it")
+            return@locked Result.failure(it)
+        }
         // 从版本管理器获取历史内容（同时保存当前内容为新版本）
         val historicalData = versionManager.restoreVersion(normalized, versionId, currentData)
-            .getOrElse { return@locked Result.failure(it) }
+            .getOrElse {
+                FLog.w(TAG, "restoreVersion failed: version not found $normalized/$versionId")
+                return@locked Result.failure(it)
+            }
         // 写回文件（不触发版本保存——因为 restoreVersion 已保存了）
         val match = mountTable.findMount(normalized)
         if (match != null) {
             // 挂载点文件：通过 diskOps 写回
             match.diskOps.writeFile(match.relativePath, 0, historicalData)
-                .getOrElse { return@locked Result.failure(it) }
+                .getOrElse {
+                    FLog.e(TAG, "restoreVersion failed: cannot write back to disk $normalized", it)
+                    return@locked Result.failure(it)
+                }
             invalidateCache(normalized)
         } else {
             // 内存文件：直接替换内容
             val node = tree.resolveNode(normalized) as? FileNode
-                ?: return@locked Result.failure(FsError.NotFound(normalized))
+                ?: return@locked Result.failure(FsError.NotFound(normalized).also {
+                    FLog.w(TAG, "restoreVersion failed: node not found $normalized")
+                })
             node.blocks.clear()
             if (historicalData.isNotEmpty()) {
                 node.blocks.write(0, historicalData)
@@ -164,6 +185,7 @@ internal class InMemoryFileSystem(
             walAppend(WalEntry.Write(normalized, 0, historicalData))
         }
         eventBus.emit(normalized, FsEventKind.MODIFIED)
+        FLog.i(TAG, "restoreVersion success: path=$normalized, versionId=$versionId")
         Result.success(Unit)
     }
 
@@ -185,14 +207,19 @@ internal class InMemoryFileSystem(
         diskOps: DiskFileOperations,
         options: MountOptions
     ): Result<Unit> {
+        FLog.i(TAG, "mount: virtualPath=$virtualPath, rootPath=${diskOps.rootPath}, readOnly=${options.readOnly}")
         val mark = mc.begin()
         val result = locked {
             val normalized = PathUtils.normalize(virtualPath)
             mountTable.mount(normalized, diskOps, options)
-                .getOrElse { return@locked Result.failure(it) }
+                .getOrElse {
+                    FLog.w(TAG, "mount failed: $virtualPath, error=$it")
+                    return@locked Result.failure(it)
+                }
             tree.ensureDirPath(normalized)
             persistence.persistMounts(mountTable.toMountInfoList())
             startDiskWatcherIfSupported(normalized, diskOps)
+            FLog.d(TAG, "mount success: $virtualPath")
             Result.success(Unit)
         }
         mc.end(Op.MOUNT, mark, result)
@@ -200,15 +227,20 @@ internal class InMemoryFileSystem(
     }
 
     override suspend fun unmount(virtualPath: String): Result<Unit> {
+        FLog.i(TAG, "unmount: virtualPath=$virtualPath")
         val mark = mc.begin()
         val result = locked {
             val normalized = PathUtils.normalize(virtualPath)
             stopDiskWatcher(normalized)
-            mountTable.unmount(normalized).getOrElse { return@locked Result.failure(it) }
+            mountTable.unmount(normalized).getOrElse {
+                FLog.w(TAG, "unmount failed: $virtualPath, error=$it")
+                return@locked Result.failure(it)
+            }
             // 清除该挂载点下的所有缓存
             statCache.removeByPrefix(normalized)
             readDirCache.removeByPrefix(normalized)
             persistence.persistMounts(mountTable.toMountInfoList())
+            FLog.d(TAG, "unmount success: $virtualPath")
             Result.success(Unit)
         }
         mc.end(Op.UNMOUNT, mark, result)
@@ -231,12 +263,15 @@ internal class InMemoryFileSystem(
     // ═══════════════════════════════════════════════════════════
 
     override suspend fun sync(path: String): Result<List<FsEvent>> {
+        FLog.d(TAG, "sync: path=$path")
         val mark = mc.begin()
         val result = locked {
             ensureLoaded()
             val normalized = PathUtils.normalize(path)
             val match = mountTable.findMount(normalized)
-                ?: return@locked Result.failure(FsError.NotMounted(normalized))
+                ?: return@locked Result.failure(FsError.NotMounted(normalized).also {
+                    FLog.w(TAG, "sync failed: not mounted path=$normalized")
+                })
 
             val mountPoint = match.mountPoint
             val diskOps = match.diskOps
@@ -269,8 +304,8 @@ internal class InMemoryFileSystem(
                                 versionManager.saveVersion(vfsPath, data)
                             }
                         }
-                    } catch (_: Exception) {
-                        // 忽略读取失败
+                    } catch (e: Exception) {
+                        FLog.w(TAG, "sync: failed to save version for $vfsPath: ${e.message}")
                     }
                 }
                 invalidateCache(vfsPath)
@@ -278,6 +313,7 @@ internal class InMemoryFileSystem(
                 eventBus.emit(vfsPath, FsEventKind.MODIFIED)
             }
 
+            FLog.d(TAG, "sync completed: path=$path, events=${events.size}")
             Result.success(events)
         }
         mc.end(Op.SYNC, mark, result)
@@ -289,6 +325,7 @@ internal class InMemoryFileSystem(
     // ═══════════════════════════════════════════════════════════
 
     override suspend fun createFile(path: String): Result<Unit> {
+        FLog.d(TAG, "createFile: path=$path")
         val mark = mc.begin()
         val result = locked {
             ensureLoaded()
@@ -300,6 +337,8 @@ internal class InMemoryFileSystem(
                 if (r.isSuccess) {
                     invalidateCache(normalized)
                     eventBus.emit(normalized, FsEventKind.CREATED)
+                } else {
+                    FLog.w(TAG, "createFile failed (disk): $normalized, error=${r.exceptionOrNull()}")
                 }
                 return@locked r
             }
@@ -307,6 +346,8 @@ internal class InMemoryFileSystem(
                 if (r.isSuccess) {
                     walAppend(WalEntry.CreateFile(normalized))
                     eventBus.emit(normalized, FsEventKind.CREATED)
+                } else {
+                    FLog.w(TAG, "createFile failed: $normalized, error=${r.exceptionOrNull()}")
                 }
             }
         }
@@ -315,6 +356,7 @@ internal class InMemoryFileSystem(
     }
 
     override suspend fun createDir(path: String): Result<Unit> {
+        FLog.d(TAG, "createDir: path=$path")
         val mark = mc.begin()
         val result = locked {
             ensureLoaded()
@@ -327,6 +369,8 @@ internal class InMemoryFileSystem(
                 if (r.isSuccess) {
                     invalidateCache(normalized)
                     eventBus.emit(normalized, FsEventKind.CREATED)
+                } else {
+                    FLog.w(TAG, "createDir failed (disk): $normalized, error=${r.exceptionOrNull()}")
                 }
                 return@locked r
             }
@@ -334,6 +378,8 @@ internal class InMemoryFileSystem(
                 if (r.isSuccess) {
                     walAppend(WalEntry.CreateDir(normalized))
                     eventBus.emit(normalized, FsEventKind.CREATED)
+                } else {
+                    FLog.w(TAG, "createDir failed: $normalized, error=${r.exceptionOrNull()}")
                 }
             }
         }
@@ -342,6 +388,7 @@ internal class InMemoryFileSystem(
     }
 
     override suspend fun open(path: String, mode: OpenMode): Result<FileHandle> {
+        FLog.d(TAG, "open: path=$path, mode=$mode")
         val mark = mc.begin()
         val result = locked {
             ensureLoaded()
@@ -349,6 +396,7 @@ internal class InMemoryFileSystem(
             val match = mountTable.findMount(normalized)
             if (match != null) {
                 if (match.options.readOnly && mode != OpenMode.READ) {
+                    FLog.w(TAG, "open failed: read-only mount $normalized with mode=$mode")
                     return@locked Result.failure(FsError.PermissionDenied("挂载点只读: $normalized"))
                 }
                 return@locked Result.success(
@@ -362,9 +410,16 @@ internal class InMemoryFileSystem(
                 )
             }
             val node =
-                tree.resolveNodeOrError(normalized).getOrElse { return@locked Result.failure(it) }
-            if (node !is FileNode) return@locked Result.failure(FsError.NotFile(normalized))
+                tree.resolveNodeOrError(normalized).getOrElse {
+                    FLog.w(TAG, "open failed: $normalized not found")
+                    return@locked Result.failure(it)
+                }
+            if (node !is FileNode) {
+                FLog.w(TAG, "open failed: $normalized is not a file")
+                return@locked Result.failure(FsError.NotFile(normalized))
+            }
             if (!hasAccess(node.permissions, mode)) {
+                FLog.w(TAG, "open failed: permission denied for $normalized")
                 return@locked Result.failure(FsError.PermissionDenied(normalized))
             }
             Result.success(InMemoryFileHandle(this, node, mode, normalized, fileLockManager))
@@ -412,15 +467,21 @@ internal class InMemoryFileSystem(
     }
 
     override suspend fun delete(path: String): Result<Unit> {
+        FLog.d(TAG, "delete: path=$path")
         val mark = mc.begin()
         val result = locked {
             ensureLoaded()
             val normalized = PathUtils.normalize(path)
-            if (normalized == "/") return@locked Result.failure(FsError.PermissionDenied("/"))
+            if (normalized == "/") {
+                FLog.w(TAG, "delete failed: cannot delete root")
+                return@locked Result.failure(FsError.PermissionDenied("/"))
+            }
             if (mountTable.isMountPoint(normalized)) {
+                FLog.w(TAG, "delete failed: cannot delete mount point $normalized")
                 return@locked Result.failure(FsError.PermissionDenied("不能删除挂载点: $normalized"))
             }
             if (fileLockManager.isLocked(normalized)) {
+                FLog.w(TAG, "delete failed: file locked $normalized")
                 return@locked Result.failure(FsError.Locked(normalized))
             }
             val match = mountTable.findMount(normalized)
@@ -430,6 +491,8 @@ internal class InMemoryFileSystem(
                 if (r.isSuccess) {
                     invalidateCache(normalized)
                     eventBus.emit(normalized, FsEventKind.DELETED)
+                } else {
+                    FLog.w(TAG, "delete failed (disk): $normalized, error=${r.exceptionOrNull()}")
                 }
                 return@locked r
             }
@@ -437,6 +500,8 @@ internal class InMemoryFileSystem(
                 if (r.isSuccess) {
                     walAppend(WalEntry.Delete(normalized))
                     eventBus.emit(normalized, FsEventKind.DELETED)
+                } else {
+                    FLog.w(TAG, "delete failed: $normalized, error=${r.exceptionOrNull()}")
                 }
             }
         }
@@ -526,6 +591,7 @@ internal class InMemoryFileSystem(
     }
 
     override suspend fun writeAll(path: String, data: ByteArray): Result<Unit> {
+        FLog.d(TAG, "writeAll: path=$path, size=${data.size}")
         val mark = mc.begin()
         val normalized = PathUtils.normalize(path)
         val parentPath = normalized.substringBeforeLast('/', "/")
@@ -580,8 +646,10 @@ internal class InMemoryFileSystem(
     // ═══════════════════════════════════════════════════════════
 
     override suspend fun copy(srcPath: String, dstPath: String): Result<Unit> {
+        FLog.d(TAG, "copy: src=$srcPath, dst=$dstPath")
         val mark = mc.begin()
         val result = copyInternal(srcPath, dstPath)
+        if (result.isFailure) FLog.w(TAG, "copy failed: src=$srcPath, dst=$dstPath, error=${result.exceptionOrNull()}")
         mc.end(Op.COPY, mark, result)
         return result
     }
@@ -606,11 +674,13 @@ internal class InMemoryFileSystem(
     }
 
     override suspend fun move(srcPath: String, dstPath: String): Result<Unit> {
+        FLog.d(TAG, "move: src=$srcPath, dst=$dstPath")
         val mark = mc.begin()
         val result = run {
             copyInternal(srcPath, dstPath).getOrElse { return@run Result.failure(it) }
             deleteRecursive(srcPath)
         }
+        if (result.isFailure) FLog.w(TAG, "move failed: src=$srcPath, dst=$dstPath, error=${result.exceptionOrNull()}")
         mc.end(Op.MOVE, mark, result)
         return result
     }
@@ -642,6 +712,7 @@ internal class InMemoryFileSystem(
     }
 
     override suspend fun writeStream(path: String, dataFlow: Flow<ByteArray>): Result<Unit> {
+        FLog.d(TAG, "writeStream: path=$path")
         val normalized = PathUtils.normalize(path)
         val parentPath = normalized.substringBeforeLast('/', "/")
         if (parentPath != "/") {
@@ -672,6 +743,7 @@ internal class InMemoryFileSystem(
             eventBus.emit(normalized, FsEventKind.MODIFIED)
             Result.success(Unit)
         } catch (e: Exception) {
+            FLog.e(TAG, "writeStream failed: path=$path", e)
             Result.failure(e)
         } finally {
             handle.close()
@@ -692,7 +764,10 @@ internal class InMemoryFileSystem(
             // 配额检查：计算写入后的净增量
             val end = offset.toInt() + data.size
             val growth = maxOf(0L, end.toLong() - node.size.toLong())
-            checkQuota(growth)?.let { return@locked it }
+            checkQuota(growth)?.let {
+                FLog.w(TAG, "writeAt failed: quota exceeded, growth=$growth")
+                return@locked it
+            }
 
             // 版本保存：写入前保存当前内容
             val path = tree.pathForNode(node)
@@ -713,10 +788,12 @@ internal class InMemoryFileSystem(
 
     private fun startDiskWatcherIfSupported(mountPoint: String, diskOps: DiskFileOperations) {
         val watcher = diskOps as? DiskFileWatcher ?: return
+        FLog.d(TAG, "startDiskWatcher: mountPoint=$mountPoint")
         val job = watchScope.launch {
             watcher.watchDisk(this).collect { diskEvent ->
                 val virtualPath = if (diskEvent.relativePath == "/") mountPoint
                 else "$mountPoint${diskEvent.relativePath}"
+                FLog.v(TAG, "diskEvent: $virtualPath, kind=${diskEvent.kind}")
                 // 外部文件被修改时，保存当前内容为版本快照
                 if (diskEvent.kind == FsEventKind.MODIFIED) {
                     saveExternalChangeVersion(virtualPath, diskOps, diskEvent.relativePath)
@@ -748,8 +825,8 @@ internal class InMemoryFileSystem(
                 if (data.isNotEmpty()) {
                     versionManager.saveVersion(virtualPath, data)
                 }
-            } catch (_: Exception) {
-                // 文件可能在读取过程中被再次修改或删除，忽略异常
+            } catch (e: Exception) {
+                FLog.w(TAG, "saveExternalChangeVersion: failed for $virtualPath: ${e.message}")
             }
         }
     }
@@ -764,10 +841,23 @@ internal class InMemoryFileSystem(
 
     private suspend fun ensureLoaded() {
         val loadResult = persistence.ensureLoaded() ?: return
-        loadResult.snapshot?.let { tree.restoreFromSnapshot(it) }
-        if (loadResult.walEntries.isNotEmpty()) tree.replayWal(loadResult.walEntries)
-        if (loadResult.mountInfos.isNotEmpty()) mountTable.restoreFromPersistence(loadResult.mountInfos)
-        loadResult.versionData?.let { versionManager.restoreFromSnapshot(it.entries) }
+        FLog.i(TAG, "ensureLoaded: restoring from persistence")
+        loadResult.snapshot?.let {
+            tree.restoreFromSnapshot(it)
+            FLog.d(TAG, "ensureLoaded: snapshot restored")
+        }
+        if (loadResult.walEntries.isNotEmpty()) {
+            tree.replayWal(loadResult.walEntries)
+            FLog.d(TAG, "ensureLoaded: replayed ${loadResult.walEntries.size} WAL entries")
+        }
+        if (loadResult.mountInfos.isNotEmpty()) {
+            mountTable.restoreFromPersistence(loadResult.mountInfos)
+            FLog.d(TAG, "ensureLoaded: restored ${loadResult.mountInfos.size} mount infos")
+        }
+        loadResult.versionData?.let {
+            versionManager.restoreFromSnapshot(it.entries)
+            FLog.d(TAG, "ensureLoaded: restored version data for ${it.entries.size} files")
+        }
     }
 
     private suspend fun walAppend(entry: WalEntry) {

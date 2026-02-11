@@ -6,6 +6,7 @@ import com.hrm.fs.api.FsMeta
 import com.hrm.fs.api.FsPermissions
 import com.hrm.fs.api.FsType
 import com.hrm.fs.api.PathUtils
+import com.hrm.fs.api.log.FLog
 import com.hrm.fs.core.persistence.SnapshotNode
 import com.hrm.fs.core.persistence.SnapshotPermissions
 import com.hrm.fs.core.persistence.WalEntry
@@ -19,6 +20,8 @@ import kotlin.time.Clock
  */
 internal class VfsTree {
     companion object {
+        private const val TAG = "VfsTree"
+
         fun splitParent(path: String): Pair<String, String> {
             val normalized = PathUtils.normalize(path)
             val idx = normalized.lastIndexOf('/')
@@ -220,12 +223,14 @@ internal class VfsTree {
     fun toSnapshot(): SnapshotNode = snapshotFromNode(root)
 
     fun restoreFromSnapshot(snapshot: SnapshotNode) {
+        FLog.d(TAG, "restoreFromSnapshot: root=${snapshot.name}")
         root = buildFromSnapshot(snapshot)
     }
 
     // ── WAL 回放（静默，不抛异常） ───────────────────────────
 
     fun replayWal(entries: List<WalEntry>) {
+        FLog.d(TAG, "replayWal: ${entries.size} entries")
         entries.forEach { entry ->
             when (entry) {
                 is WalEntry.CreateFile -> createFileInternal(entry.path)
