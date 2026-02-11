@@ -18,7 +18,7 @@ class AdvancedFeaturesTest {
         val content = "ABCDEFGHIJKLMNOP" // 16 bytes
         fs.writeAll("/big.txt", content.encodeToByteArray()).getOrThrow()
 
-        val chunks = fs.readStream("/big.txt", chunkSize = 5).toList()
+        val chunks = fs.streams.read("/big.txt", chunkSize = 5).toList()
         // 16 bytes / 5 = 4 chunks (5, 5, 5, 1)
         assertEquals(4, chunks.size)
         assertEquals("ABCDE", chunks[0].decodeToString())
@@ -34,7 +34,7 @@ class AdvancedFeaturesTest {
             "Hello ".encodeToByteArray(),
             "World".encodeToByteArray()
         )
-        fs.writeStream("/stream.txt", dataFlow).getOrThrow()
+        fs.streams.write("/stream.txt", dataFlow).getOrThrow()
         val content = fs.readAll("/stream.txt").getOrThrow().decodeToString()
         assertEquals("Hello World", content)
     }
@@ -90,7 +90,7 @@ class AdvancedFeaturesTest {
         fs.readDir("/a").getOrThrow()
         fs.delete("/a/f.txt").getOrThrow()
 
-        val m = fs.metrics()
+        val m = fs.observe.metrics()
         assertEquals(1L, m.createDir.count)
         assertEquals(1L, m.createDir.successCount)
         assertEquals(1L, m.createFile.count)
@@ -106,7 +106,7 @@ class AdvancedFeaturesTest {
         fs.writeAll("/f.txt", data).getOrThrow()
         fs.readAll("/f.txt").getOrThrow()
 
-        val m = fs.metrics()
+        val m = fs.observe.metrics()
         assertEquals(data.size.toLong(), m.totalBytesWritten)
         assertEquals(data.size.toLong(), m.totalBytesRead)
     }
@@ -119,7 +119,7 @@ class AdvancedFeaturesTest {
         // delete 不存在的路径
         fs.delete("/no-such")
 
-        val m = fs.metrics()
+        val m = fs.observe.metrics()
         assertEquals(1L, m.stat.failureCount)
         assertEquals(1L, m.delete.failureCount)
     }
@@ -128,10 +128,10 @@ class AdvancedFeaturesTest {
     fun metrics_reset() = runTest {
         val fs = createFs()
         fs.createDir("/a").getOrThrow()
-        assertTrue(fs.metrics().createDir.count > 0)
+        assertTrue(fs.observe.metrics().createDir.count > 0)
 
-        fs.resetMetrics()
-        val m = fs.metrics()
+        fs.observe.resetMetrics()
+        val m = fs.observe.metrics()
         assertEquals(0L, m.createDir.count)
         assertEquals(0L, m.totalBytesRead)
         assertEquals(0L, m.totalBytesWritten)
@@ -145,7 +145,7 @@ class AdvancedFeaturesTest {
     fun cache_stat_returns_consistent_result_for_mount() = runTest {
         val fs = createFs()
         val diskOps = FakeDiskFileOperations()
-        fs.mount("/mnt", diskOps).getOrThrow()
+        fs.mounts.mount("/mnt", diskOps).getOrThrow()
         diskOps.files["/hello.txt"] = "world".encodeToByteArray()
 
         // 第一次 stat 从磁盘读取
@@ -163,7 +163,7 @@ class AdvancedFeaturesTest {
     fun cache_readDir_returns_consistent_result_for_mount() = runTest {
         val fs = createFs()
         val diskOps = FakeDiskFileOperations()
-        fs.mount("/mnt", diskOps).getOrThrow()
+        fs.mounts.mount("/mnt", diskOps).getOrThrow()
         diskOps.files["/a.txt"] = ByteArray(0)
         diskOps.files["/b.txt"] = ByteArray(0)
 
@@ -178,7 +178,7 @@ class AdvancedFeaturesTest {
     fun cache_invalidated_on_createFile() = runTest {
         val fs = createFs()
         val diskOps = FakeDiskFileOperations()
-        fs.mount("/mnt", diskOps).getOrThrow()
+        fs.mounts.mount("/mnt", diskOps).getOrThrow()
 
         // 填充 readDir 缓存
         val list1 = fs.readDir("/mnt").getOrThrow()
@@ -195,7 +195,7 @@ class AdvancedFeaturesTest {
     fun cache_invalidated_on_delete() = runTest {
         val fs = createFs()
         val diskOps = FakeDiskFileOperations()
-        fs.mount("/mnt", diskOps).getOrThrow()
+        fs.mounts.mount("/mnt", diskOps).getOrThrow()
         fs.createFile("/mnt/f.txt").getOrThrow()
 
         // 填充 stat 缓存
@@ -211,7 +211,7 @@ class AdvancedFeaturesTest {
     fun cache_cleared_on_unmount() = runTest {
         val fs = createFs()
         val diskOps = FakeDiskFileOperations()
-        fs.mount("/mnt", diskOps).getOrThrow()
+        fs.mounts.mount("/mnt", diskOps).getOrThrow()
         diskOps.files["/f.txt"] = "data".encodeToByteArray()
 
         // 填充缓存
@@ -219,8 +219,8 @@ class AdvancedFeaturesTest {
         fs.readDir("/mnt").getOrThrow()
 
         // unmount 后再 mount，缓存应已清空
-        fs.unmount("/mnt").getOrThrow()
-        fs.mount("/mnt", diskOps).getOrThrow()
+        fs.mounts.unmount("/mnt").getOrThrow()
+        fs.mounts.mount("/mnt", diskOps).getOrThrow()
 
         // 修改磁盘数据
         diskOps.files["/f.txt"] = "updated-data".encodeToByteArray()
@@ -298,7 +298,7 @@ class AdvancedFeaturesTest {
         fs.writeAll("/big.bin", data).getOrThrow()
 
         // 用 readStream 分块读取
-        val chunks = fs.readStream("/big.bin", chunkSize = 32 * 1024).toList()
+        val chunks = fs.streams.read("/big.bin", chunkSize = 32 * 1024).toList()
         // 200KB / 32KB = 6.25 → 7 chunks
         assertEquals(7, chunks.size)
 
@@ -320,7 +320,7 @@ class AdvancedFeaturesTest {
     @Test
     fun quota_info_no_limit() = runTest {
         val fs = createFs()
-        val info = fs.quotaInfo()
+        val info = fs.observe.quotaInfo()
         assertFalse(info.hasQuota)
         assertEquals(-1L, info.quotaBytes)
         assertEquals(Long.MAX_VALUE, info.availableBytes)
@@ -329,13 +329,13 @@ class AdvancedFeaturesTest {
     @Test
     fun quota_info_tracks_usage() = runTest {
         val fs = createFsWithQuota(1024)
-        val info1 = fs.quotaInfo()
+        val info1 = fs.observe.quotaInfo()
         assertEquals(1024L, info1.quotaBytes)
         assertEquals(0L, info1.usedBytes)
         assertEquals(1024L, info1.availableBytes)
 
         fs.writeAll("/f.txt", ByteArray(100)).getOrThrow()
-        val info2 = fs.quotaInfo()
+        val info2 = fs.observe.quotaInfo()
         assertEquals(100L, info2.usedBytes)
         assertEquals(924L, info2.availableBytes)
     }
@@ -358,22 +358,22 @@ class AdvancedFeaturesTest {
 
         // 覆盖写入，文件大小不变（80 → 80），不应该超出配额
         fs.writeAll("/f.txt", ByteArray(80)).getOrThrow()
-        assertEquals(80L, fs.quotaInfo().usedBytes)
+        assertEquals(80L, fs.observe.quotaInfo().usedBytes)
     }
 
     @Test
     fun quota_freed_on_delete() = runTest {
         val fs = createFsWithQuota(200)
         fs.writeAll("/a.txt", ByteArray(100)).getOrThrow()
-        assertEquals(100L, fs.quotaInfo().usedBytes)
+        assertEquals(100L, fs.observe.quotaInfo().usedBytes)
 
         fs.delete("/a.txt").getOrThrow()
-        assertEquals(0L, fs.quotaInfo().usedBytes)
-        assertEquals(200L, fs.quotaInfo().availableBytes)
+        assertEquals(0L, fs.observe.quotaInfo().usedBytes)
+        assertEquals(200L, fs.observe.quotaInfo().availableBytes)
 
         // 删除后空间释放，可以写入新文件
         fs.writeAll("/b.txt", ByteArray(180)).getOrThrow()
-        assertEquals(180L, fs.quotaInfo().usedBytes)
+        assertEquals(180L, fs.observe.quotaInfo().usedBytes)
     }
 
     @Test
@@ -381,7 +381,7 @@ class AdvancedFeaturesTest {
         val fs = createFs()  // 无配额限制
         // 写入较大数据不应报错
         fs.writeAll("/big.bin", ByteArray(1024 * 1024)).getOrThrow()
-        assertTrue(fs.quotaInfo().usedBytes >= 1024 * 1024)
+        assertTrue(fs.observe.quotaInfo().usedBytes >= 1024 * 1024)
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -394,7 +394,7 @@ class AdvancedFeaturesTest {
         val content = "Hello PicoFS"
         fs.writeAll("/f.txt", content.encodeToByteArray()).getOrThrow()
 
-        val hash = fs.checksum("/f.txt", ChecksumAlgorithm.CRC32).getOrThrow()
+        val hash = fs.checksum.compute("/f.txt", ChecksumAlgorithm.CRC32).getOrThrow()
         // CRC32 应返回 8 位十六进制字符串
         assertEquals(8, hash.length)
         assertTrue(hash.all { it in '0'..'9' || it in 'a'..'f' })
@@ -406,7 +406,7 @@ class AdvancedFeaturesTest {
         val content = "Hello PicoFS"
         fs.writeAll("/f.txt", content.encodeToByteArray()).getOrThrow()
 
-        val hash = fs.checksum("/f.txt", ChecksumAlgorithm.SHA256).getOrThrow()
+        val hash = fs.checksum.compute("/f.txt", ChecksumAlgorithm.SHA256).getOrThrow()
         // SHA-256 应返回 64 位十六进制字符串
         assertEquals(64, hash.length)
         assertTrue(hash.all { it in '0'..'9' || it in 'a'..'f' })
@@ -419,8 +419,8 @@ class AdvancedFeaturesTest {
         fs.writeAll("/a.txt", content).getOrThrow()
         fs.writeAll("/b.txt", content).getOrThrow()
 
-        val hashA = fs.checksum("/a.txt").getOrThrow()
-        val hashB = fs.checksum("/b.txt").getOrThrow()
+        val hashA = fs.checksum.compute("/a.txt").getOrThrow()
+        val hashB = fs.checksum.compute("/b.txt").getOrThrow()
         assertEquals(hashA, hashB)
     }
 
@@ -430,8 +430,8 @@ class AdvancedFeaturesTest {
         fs.writeAll("/a.txt", "aaa".encodeToByteArray()).getOrThrow()
         fs.writeAll("/b.txt", "bbb".encodeToByteArray()).getOrThrow()
 
-        val hashA = fs.checksum("/a.txt").getOrThrow()
-        val hashB = fs.checksum("/b.txt").getOrThrow()
+        val hashA = fs.checksum.compute("/a.txt").getOrThrow()
+        val hashB = fs.checksum.compute("/b.txt").getOrThrow()
         assertNotEquals(hashA, hashB)
     }
 
@@ -440,14 +440,14 @@ class AdvancedFeaturesTest {
         val fs = createFs()
         fs.createFile("/empty.txt").getOrThrow()
 
-        val hash = fs.checksum("/empty.txt").getOrThrow()
+        val hash = fs.checksum.compute("/empty.txt").getOrThrow()
         assertEquals(64, hash.length) // SHA-256 默认
     }
 
     @Test
     fun checksum_not_found() = runTest {
         val fs = createFs()
-        val result = fs.checksum("/missing.txt")
+        val result = fs.checksum.compute("/missing.txt")
         assertTrue(result.isFailure)
         assertIs<FsError.NotFound>(result.exceptionOrNull())
     }
@@ -456,7 +456,7 @@ class AdvancedFeaturesTest {
     fun checksum_on_directory_fails() = runTest {
         val fs = createFs()
         fs.createDir("/d").getOrThrow()
-        val result = fs.checksum("/d")
+        val result = fs.checksum.compute("/d")
         assertTrue(result.isFailure)
         assertIs<FsError.NotFile>(result.exceptionOrNull())
     }
@@ -466,7 +466,7 @@ class AdvancedFeaturesTest {
         // 验证 SHA-256 实现正确性：空字节数组的 SHA-256
         val fs = createFs()
         fs.createFile("/empty.txt").getOrThrow()
-        val hash = fs.checksum("/empty.txt", ChecksumAlgorithm.SHA256).getOrThrow()
+        val hash = fs.checksum.compute("/empty.txt", ChecksumAlgorithm.SHA256).getOrThrow()
         // SHA-256("") = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
         assertEquals("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", hash)
     }
@@ -475,7 +475,7 @@ class AdvancedFeaturesTest {
     fun checksum_crc32_known_value() = runTest {
         val fs = createFs()
         fs.createFile("/empty.txt").getOrThrow()
-        val hash = fs.checksum("/empty.txt", ChecksumAlgorithm.CRC32).getOrThrow()
+        val hash = fs.checksum.compute("/empty.txt", ChecksumAlgorithm.CRC32).getOrThrow()
         // CRC32("") = 00000000
         assertEquals("00000000", hash)
     }

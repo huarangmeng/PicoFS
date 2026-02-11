@@ -123,13 +123,29 @@ interface FileHandle {
     suspend fun close(): Result<Unit>
 }
 
+// ═══════════════════════════════════════════════════════════════
+// 核心文件系统接口
+// ═══════════════════════════════════════════════════════════════
+
 /**
- * 虚拟文件系统接口。
+ * 虚拟文件系统核心接口。
  *
- * 上层永远只操作虚拟路径（如 `/docs/hello.txt`），
- * 可以通过 [mount] 将虚拟路径挂载到真实磁盘目录，
- * 挂载点下的操作会自动代理到真实文件系统。
- * 未挂载的路径使用纯内存存储。
+ * 包含最常用的文件/目录 CRUD 操作。
+ * 扩展能力通过子接口属性访问：
+ *
+ * ```kotlin
+ * val fs = createFileSystem()
+ *
+ * // 核心 CRUD —— 直接调用
+ * fs.createFile("/hello.txt")
+ * fs.writeAll("/hello.txt", "world".encodeToByteArray())
+ *
+ * // 扩展能力 —— 通过属性访问
+ * fs.mounts.mount("/disk", diskOps)
+ * fs.versions.list("/hello.txt")
+ * fs.xattr.set("/hello.txt", "tag", "important".encodeToByteArray())
+ * fs.search.find(SearchQuery(namePattern = "*.txt"))
+ * ```
  */
 interface FileSystem {
     // ─── 基础 CRUD ───────────────────────────────────────────
@@ -150,30 +166,6 @@ interface FileSystem {
     /** 递归删除目录及其所有内容（类似 rm -rf）。 */
     suspend fun deleteRecursive(path: String): Result<Unit>
 
-    // ─── 符号链接 ────────────────────────────────────────────
-
-    /**
-     * 创建符号链接。
-     *
-     * 在 [linkPath] 处创建一个指向 [targetPath] 的符号链接。
-     * [targetPath] 可以是绝对路径或相对路径（相对于 linkPath 所在目录）。
-     * 创建时不验证目标是否存在（允许悬空链接）。
-     *
-     * @param linkPath 符号链接的虚拟路径
-     * @param targetPath 链接指向的目标路径
-     */
-    suspend fun createSymlink(linkPath: String, targetPath: String): Result<Unit>
-
-    /**
-     * 读取符号链接的目标路径。
-     *
-     * 返回符号链接指向的原始目标路径（不解析）。
-     *
-     * @param path 符号链接的虚拟路径
-     * @return 链接目标路径
-     */
-    suspend fun readLink(path: String): Result<String>
-
     // ─── 便捷读写 ────────────────────────────────────────────
 
     /** 一次性读取文件全部内容。 */
@@ -193,15 +185,44 @@ interface FileSystem {
     /** rename 是 move 的别名。 */
     suspend fun rename(srcPath: String, dstPath: String): Result<Unit> = move(srcPath, dstPath)
 
-    // ─── 挂载 ────────────────────────────────────────────────
+    // ─── 扩展能力 ────────────────────────────────────────────
 
+    /** 挂载管理：mount / unmount / sync / listMounts / pendingMounts */
+    val mounts: FsMounts
+
+    /** 版本历史：fileVersions / readVersion / restoreVersion */
+    val versions: FsVersions
+
+    /** 搜索查找：find */
+    val search: FsSearch
+
+    /** 可观测性：watch / metrics / resetMetrics / quotaInfo */
+    val observe: FsObserve
+
+    /** 流式读写：readStream / writeStream */
+    val streams: FsStreams
+
+    /** 文件校验：checksum */
+    val checksum: FsChecksum
+
+    /** 扩展属性：set / get / remove / list */
+    val xattr: FsXattr
+
+    /** 符号链接：create / readLink */
+    val symlinks: FsSymlinks
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 扩展能力子接口
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * 挂载管理。
+ */
+interface FsMounts {
     /**
      * 将虚拟路径 [virtualPath] 挂载到真实磁盘目录 [diskOps]。
      * 挂载后，对 [virtualPath] 及其子路径的操作将代理到 [diskOps]。
-     *
-     * @param virtualPath 虚拟挂载点（如 "/data"）
-     * @param diskOps 真实磁盘操作接口
-     * @param options 挂载选项（如只读）
      */
     suspend fun mount(
         virtualPath: String,
@@ -213,178 +234,146 @@ interface FileSystem {
     suspend fun unmount(virtualPath: String): Result<Unit>
 
     /** 列出当前所有挂载点。 */
-    suspend fun listMounts(): List<String>
+    suspend fun list(): List<String>
 
     /**
      * 返回从持久化恢复但尚未被重新 [mount] 的挂载点信息。
-     *
-     * 每个 [PendingMount] 包含曾经的虚拟路径、磁盘根路径和只读标记，
-     * 外部可据此用平台对应的 [DiskFileOperations] 重新调用 [mount] 恢复。
-     * 成功 mount 后该条目会自动移除。
      */
-    suspend fun pendingMounts(): List<PendingMount>
+    suspend fun pending(): List<PendingMount>
 
     /**
      * 手动同步指定挂载点路径与真实磁盘的状态。
-     *
-     * 扫描磁盘目录与上次快照的差异，为新增/删除/修改的文件产生 [FsEvent]。
-     * 适用于 [DiskFileWatcher] 不可用的降级场景，或者需要一次性全量同步的场合。
      *
      * @param path 虚拟路径（必须位于某个挂载点下，或为挂载点本身）
      * @return 本次 sync 检测到的事件列表
      */
     suspend fun sync(path: String): Result<List<FsEvent>>
+}
 
-    // ─── 监听 ────────────────────────────────────────────────
+/**
+ * 版本历史管理。
+ */
+interface FsVersions {
+    /**
+     * 获取文件的版本历史列表（最新在前）。
+     */
+    suspend fun list(path: String): Result<List<FileVersion>>
 
     /**
-     * 监听虚拟路径变化事件。
-     * 返回的 Flow 会在文件被创建/修改/删除时发出 [FsEvent]。
-     *
-     * @param path 监听的虚拟路径（监听该路径及其子路径的事件）
+     * 读取文件的某个历史版本内容。
      */
-    fun watch(path: String): Flow<FsEvent>
-
-    // ─── 流式读写 ────────────────────────────────────────────
+    suspend fun read(path: String, versionId: String): Result<ByteArray>
 
     /**
-     * 以 Flow 方式流式读取文件内容，适合大文件。
-     *
-     * @param path 虚拟路径
-     * @param chunkSize 每个 chunk 的字节数
+     * 恢复文件到某个历史版本。
      */
-    fun readStream(path: String, chunkSize: Int = 8192): Flow<ByteArray>
+    suspend fun restore(path: String, versionId: String): Result<Unit>
+}
 
-    /**
-     * 以 Flow 方式流式写入文件内容。
-     * 会先清空文件再逐 chunk 追加。
-     *
-     * @param path 虚拟路径
-     * @param dataFlow 数据流
-     */
-    suspend fun writeStream(path: String, dataFlow: Flow<ByteArray>): Result<Unit>
-
-    // ─── 可观测性 ─────────────────────────────────────────────
-
-    /**
-     * 获取当前文件系统的统计指标快照。
-     */
-    fun metrics(): FsMetrics
-
-    /**
-     * 重置所有统计指标。
-     */
-    fun resetMetrics()
-
-    // ─── 配额 ────────────────────────────────────────────────
-
-    /**
-     * 获取当前虚拟文件系统的空间配额信息。
-     * 仅统计内存文件树的使用量（挂载点使用真实磁盘，不计入配额）。
-     */
-    fun quotaInfo(): QuotaInfo
-
-    // ─── 文件哈希 / 校验 ─────────────────────────────────────────
-
-    /**
-     * 计算文件的校验值。
-     *
-     * 支持内存文件和挂载点文件。对于大文件会读取全部内容后计算。
-     *
-     * @param path 虚拟路径
-     * @param algorithm 校验算法（默认 SHA-256）
-     * @return 十六进制小写字符串
-     */
-    suspend fun checksum(
-        path: String,
-        algorithm: ChecksumAlgorithm = ChecksumAlgorithm.SHA256
-    ): Result<String>
-
-    // ─── 搜索 / 查找 ─────────────────────────────────────────────
-
+/**
+ * 搜索查找。
+ */
+interface FsSearch {
     /**
      * 在指定目录下递归搜索文件和目录。
      *
      * 支持按文件名模式匹配（类 `find`）和按文件内容匹配（类 `grep`）。
-     * 同时支持内存文件树和挂载点下的文件搜索。
-     *
-     * @param query 搜索查询条件
-     * @return 匹配的搜索结果列表
      */
     suspend fun find(query: SearchQuery): Result<List<SearchResult>>
-
-    // ─── 版本历史 ───────────────────────────────────────────────
-
-    /**
-     * 获取文件的版本历史列表（最新在前）。
-     *
-     * 支持内存文件和挂载点文件。
-     * 每次通过 [FileHandle.writeAt]、[writeAll]、[writeStream] 写入时自动保存历史版本。
-     *
-     * @param path 虚拟路径
-     * @return 版本列表
-     */
-    suspend fun fileVersions(path: String): Result<List<FileVersion>>
-
-    /**
-     * 读取文件的某个历史版本内容。
-     *
-     * @param path 虚拟路径
-     * @param versionId 版本 ID（从 [fileVersions] 获取）
-     * @return 该版本的文件内容
-     */
-    suspend fun readVersion(path: String, versionId: String): Result<ByteArray>
-
-    /**
-     * 恢复文件到某个历史版本。
-     *
-     * 将指定版本的内容写回文件（同时当前内容也会作为新版本保存）。
-     *
-     * @param path 虚拟路径
-     * @param versionId 要恢复到的版本 ID
-     */
-    suspend fun restoreVersion(path: String, versionId: String): Result<Unit>
-
-    // ─── 扩展属性（xattr） ──────────────────────────────────────
-
-    /**
-     * 设置文件或目录的扩展属性。
-     *
-     * 如果属性已存在则覆盖，不存在则创建。
-     * 仅支持内存文件树中的节点（挂载点不支持）。
-     *
-     * @param path 虚拟路径
-     * @param name 属性名（如 "user.tag", "color"）
-     * @param value 属性值（任意字节数据）
-     */
-    suspend fun setXattr(path: String, name: String, value: ByteArray): Result<Unit>
-
-    /**
-     * 获取文件或目录的扩展属性值。
-     *
-     * @param path 虚拟路径
-     * @param name 属性名
-     * @return 属性值，属性不存在时返回 [FsError.NotFound]
-     */
-    suspend fun getXattr(path: String, name: String): Result<ByteArray>
-
-    /**
-     * 删除文件或目录的扩展属性。
-     *
-     * @param path 虚拟路径
-     * @param name 属性名
-     * @return 属性不存在时返回 [FsError.NotFound]
-     */
-    suspend fun removeXattr(path: String, name: String): Result<Unit>
-
-    /**
-     * 列出文件或目录的所有扩展属性名。
-     *
-     * @param path 虚拟路径
-     * @return 属性名列表
-     */
-    suspend fun listXattrs(path: String): Result<List<String>>
 }
+
+/**
+ * 可观测性：事件监听 + 指标 + 配额。
+ */
+interface FsObserve {
+    /**
+     * 监听虚拟路径变化事件。
+     */
+    fun watch(path: String): Flow<FsEvent>
+
+    /** 获取当前文件系统的统计指标快照。 */
+    fun metrics(): FsMetrics
+
+    /** 重置所有统计指标。 */
+    fun resetMetrics()
+
+    /** 获取当前虚拟文件系统的空间配额信息。 */
+    fun quotaInfo(): QuotaInfo
+}
+
+/**
+ * 流式读写（适合大文件）。
+ */
+interface FsStreams {
+    /**
+     * 以 Flow 方式流式读取文件内容。
+     *
+     * @param chunkSize 每个 chunk 的字节数
+     */
+    fun read(path: String, chunkSize: Int = 8192): Flow<ByteArray>
+
+    /**
+     * 以 Flow 方式流式写入文件内容。
+     * 会先清空文件再逐 chunk 追加。
+     */
+    suspend fun write(path: String, dataFlow: Flow<ByteArray>): Result<Unit>
+}
+
+/**
+ * 文件校验。
+ */
+interface FsChecksum {
+    /**
+     * 计算文件的校验值。
+     *
+     * @param algorithm 校验算法（默认 SHA-256）
+     * @return 十六进制小写字符串
+     */
+    suspend fun compute(
+        path: String,
+        algorithm: ChecksumAlgorithm = ChecksumAlgorithm.SHA256
+    ): Result<String>
+}
+
+/**
+ * 扩展属性（xattr）。
+ */
+interface FsXattr {
+    /** 设置扩展属性。如果已存在则覆盖。 */
+    suspend fun set(path: String, name: String, value: ByteArray): Result<Unit>
+
+    /** 获取扩展属性值。属性不存在时返回 [FsError.NotFound]。 */
+    suspend fun get(path: String, name: String): Result<ByteArray>
+
+    /** 删除扩展属性。 */
+    suspend fun remove(path: String, name: String): Result<Unit>
+
+    /** 列出所有扩展属性名。 */
+    suspend fun list(path: String): Result<List<String>>
+}
+
+/**
+ * 符号链接。
+ */
+interface FsSymlinks {
+    /**
+     * 创建符号链接。
+     *
+     * 在 [linkPath] 处创建一个指向 [targetPath] 的符号链接。
+     * [targetPath] 可以是绝对路径或相对路径。
+     * 创建时不验证目标是否存在（允许悬空链接）。
+     */
+    suspend fun create(linkPath: String, targetPath: String): Result<Unit>
+
+    /**
+     * 读取符号链接的目标路径（不解析）。
+     */
+    suspend fun readLink(path: String): Result<String>
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 磁盘操作接口
+// ═══════════════════════════════════════════════════════════════
 
 /**
  * 真实磁盘文件操作接口。
@@ -406,40 +395,21 @@ interface DiskFileOperations {
 
     // ── 扩展属性（xattr） ──────────────────────────────────────
 
-    /**
-     * 设置文件或目录的扩展属性。
-     * 默认返回 [FsError.PermissionDenied]，平台实现可覆盖。
-     */
     suspend fun setXattr(path: String, name: String, value: ByteArray): Result<Unit> =
         Result.failure(FsError.PermissionDenied("xattr not supported"))
 
-    /**
-     * 获取文件或目录的扩展属性值。
-     * 默认返回 [FsError.PermissionDenied]，平台实现可覆盖。
-     */
     suspend fun getXattr(path: String, name: String): Result<ByteArray> =
         Result.failure(FsError.PermissionDenied("xattr not supported"))
 
-    /**
-     * 删除文件或目录的扩展属性。
-     * 默认返回 [FsError.PermissionDenied]，平台实现可覆盖。
-     */
     suspend fun removeXattr(path: String, name: String): Result<Unit> =
         Result.failure(FsError.PermissionDenied("xattr not supported"))
 
-    /**
-     * 列出文件或目录的所有扩展属性名。
-     * 默认返回 [FsError.PermissionDenied]，平台实现可覆盖。
-     */
     suspend fun listXattrs(path: String): Result<List<String>> =
         Result.failure(FsError.PermissionDenied("xattr not supported"))
 }
 
 /**
  * 磁盘文件变更事件（由 [DiskFileWatcher] 产生）。
- *
- * @param relativePath 相对于监听根目录的路径（如 "/docs/a.txt"）
- * @param kind 变更类型
  */
 data class DiskFileEvent(
     val relativePath: String,
@@ -448,66 +418,26 @@ data class DiskFileEvent(
 
 /**
  * 可选的磁盘文件变更监听接口。
- *
- * [DiskFileOperations] 的实现类如果同时实现了此接口，
- * 则在 [FileSystem.mount] 时会自动启动监听，
- * 将外部程序对磁盘目录的变更同步到虚拟文件系统的事件流中。
- *
- * 使用方式：平台层的 `DiskFileOperations` 实现同时实现此接口即可，
- * 无需额外配置。
- *
- * ```kotlin
- * class JvmDiskFileOperations(...) : DiskFileOperations, DiskFileWatcher {
- *     override fun watchDisk(scope: CoroutineScope): Flow<DiskFileEvent> { ... }
- *     override fun stopWatching() { ... }
- * }
- * ```
  */
 interface DiskFileWatcher {
-    /**
-     * 启动对 [DiskFileOperations.rootPath] 目录的递归监听。
-     *
-     * 返回一个 [Flow]，在外部程序创建/修改/删除文件时发出 [DiskFileEvent]。
-     * 该 Flow 应在给定的 [scope] 内工作，[scope] 取消时监听自动停止。
-     *
-     * @param scope 协程作用域，控制监听生命周期
-     * @return 变更事件流
-     */
     fun watchDisk(scope: kotlinx.coroutines.CoroutineScope): Flow<DiskFileEvent>
-
-    /**
-     * 手动停止监听。
-     * 也可以通过取消 [watchDisk] 传入的 scope 来停止。
-     */
     fun stopWatching()
 }
 
-// ─── 可观测性指标 ──────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// 数据类型
+// ═══════════════════════════════════════════════════════════════
 
-/**
- * 单个操作类型的统计指标。
- */
 data class OpMetrics(
-    /** 调用次数。 */
     val count: Long = 0,
-    /** 成功次数。 */
     val successCount: Long = 0,
-    /** 失败次数。 */
     val failureCount: Long = 0,
-    /** 累计耗时（毫秒）。 */
     val totalTimeMs: Long = 0,
-    /** 最大耗时（毫秒）。 */
     val maxTimeMs: Long = 0
 ) {
-    /** 平均耗时（毫秒），若无调用则为 0。 */
     val avgTimeMs: Double get() = if (count > 0) totalTimeMs.toDouble() / count else 0.0
 }
 
-/**
- * 文件系统全局统计指标快照。
- *
- * 每个字段对应一种操作类型的 [OpMetrics]。
- */
 data class FsMetrics(
     val createFile: OpMetrics = OpMetrics(),
     val createDir: OpMetrics = OpMetrics(),
@@ -523,69 +453,27 @@ data class FsMetrics(
     val unmount: OpMetrics = OpMetrics(),
     val sync: OpMetrics = OpMetrics(),
     val setPermissions: OpMetrics = OpMetrics(),
-    /** 总读取字节数。 */
     val totalBytesRead: Long = 0,
-    /** 总写入字节数。 */
     val totalBytesWritten: Long = 0
 )
 
-/**
- * 虚拟文件系统的空间配额信息。
- *
- * @param quotaBytes 配额上限（字节），-1 表示无限制
- * @param usedBytes 当前已使用字节数（内存文件树）
- */
 data class QuotaInfo(
     val quotaBytes: Long,
     val usedBytes: Long
 ) {
-    /** 剩余可用字节数，无限制时返回 [Long.MAX_VALUE]。 */
     val availableBytes: Long
         get() = if (quotaBytes < 0) Long.MAX_VALUE else maxOf(0, quotaBytes - usedBytes)
-
-    /** 是否启用了配额限制。 */
     val hasQuota: Boolean get() = quotaBytes >= 0
 }
 
-// ─── 校验算法 ────────────────────────────────────────────────
+enum class ChecksumAlgorithm { CRC32, SHA256 }
 
-/**
- * 支持的文件校验算法。
- */
-enum class ChecksumAlgorithm {
-    /** CRC32 校验码（8 位十六进制）。 */
-    CRC32,
-    /** SHA-256 哈希（64 位十六进制）。 */
-    SHA256
-}
-
-// ─── 文件版本 ────────────────────────────────────────────────
-
-/**
- * 文件历史版本的元数据。
- *
- * @param versionId 版本唯一标识符
- * @param timestampMillis 版本保存时间戳（毫秒）
- * @param size 该版本的文件大小（字节）
- */
 data class FileVersion(
     val versionId: String,
     val timestampMillis: Long,
     val size: Long
 )
 
-// ─── 搜索查询与结果 ──────────────────────────────────────────
-
-/**
- * 搜索查询条件。
- *
- * @param rootPath 搜索的根目录（默认 "/"）
- * @param namePattern 文件名匹配模式（支持 `*` 和 `?` 通配符，如 `*.txt`、`doc?.md`）。为 null 时不过滤文件名。
- * @param contentPattern 文件内容匹配（普通子串匹配）。为 null 时不过滤内容。仅对文件生效。
- * @param typeFilter 只搜索指定类型。为 null 时搜索所有类型。
- * @param maxDepth 最大递归深度（-1 表示无限制，0 表示只搜索 rootPath 本身，1 表示只搜索直接子项）。
- * @param caseSensitive 文件名和内容匹配是否区分大小写（默认 false）。
- */
 data class SearchQuery(
     val rootPath: String = "/",
     val namePattern: String? = null,
@@ -595,14 +483,6 @@ data class SearchQuery(
     val caseSensitive: Boolean = false
 )
 
-/**
- * 搜索结果条目。
- *
- * @param path 匹配项的虚拟路径
- * @param type 文件类型
- * @param size 文件大小（目录为 0）
- * @param matchedLines 当按内容搜索时，匹配的行列表（行号从 1 开始）。文件名搜索时为空列表。
- */
 data class SearchResult(
     val path: String,
     val type: FsType,
@@ -610,16 +490,14 @@ data class SearchResult(
     val matchedLines: List<MatchedLine> = emptyList()
 )
 
-/**
- * 内容搜索匹配到的行。
- *
- * @param lineNumber 行号（从 1 开始）
- * @param content 该行的完整内容
- */
 data class MatchedLine(
     val lineNumber: Int,
     val content: String
 )
+
+// ═══════════════════════════════════════════════════════════════
+// 存储 & 错误
+// ═══════════════════════════════════════════════════════════════
 
 interface FsStorage {
     suspend fun read(key: String): Result<ByteArray?>

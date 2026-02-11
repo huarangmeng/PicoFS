@@ -11,8 +11,8 @@ class MountTest {
         val fs = createFs()
         val fakeDisk = FakeDiskFileOperations()
 
-        fs.mount("/mnt", fakeDisk).getOrThrow()
-        assertEquals(listOf("/mnt"), fs.listMounts())
+        fs.mounts.mount("/mnt", fakeDisk).getOrThrow()
+        assertEquals(listOf("/mnt"), fs.mounts.list())
 
         // 创建文件
         fs.createDir("/mnt/sub").getOrThrow()
@@ -25,7 +25,7 @@ class MountTest {
     @Test
     fun mount_root_fails() = runTest {
         val fs = createFs()
-        val result = fs.mount("/", FakeDiskFileOperations())
+        val result = fs.mounts.mount("/", FakeDiskFileOperations())
         assertTrue(result.isFailure)
     }
 
@@ -33,15 +33,15 @@ class MountTest {
     fun unmount_removes() = runTest {
         val fs = createFs()
         val fakeDisk = FakeDiskFileOperations()
-        fs.mount("/mnt", fakeDisk).getOrThrow()
-        fs.unmount("/mnt").getOrThrow()
-        assertTrue(fs.listMounts().isEmpty())
+        fs.mounts.mount("/mnt", fakeDisk).getOrThrow()
+        fs.mounts.unmount("/mnt").getOrThrow()
+        assertTrue(fs.mounts.list().isEmpty())
     }
 
     @Test
     fun unmount_notMounted_fails() = runTest {
         val fs = createFs()
-        val result = fs.unmount("/nowhere")
+        val result = fs.mounts.unmount("/nowhere")
         assertTrue(result.isFailure)
         assertIs<FsError.NotMounted>(result.exceptionOrNull())
     }
@@ -50,7 +50,7 @@ class MountTest {
     fun mount_readOnly_blocks_write() = runTest {
         val fs = createFs()
         val fakeDisk = FakeDiskFileOperations()
-        fs.mount("/ro", fakeDisk, MountOptions(readOnly = true)).getOrThrow()
+        fs.mounts.mount("/ro", fakeDisk, MountOptions(readOnly = true)).getOrThrow()
 
         val result = fs.createFile("/ro/test.txt")
         assertTrue(result.isFailure)
@@ -62,12 +62,12 @@ class MountTest {
         val fs = createFs()
         val fakeDisk = FakeDiskFileOperations()
         // 先用可写挂载创建文件
-        fs.mount("/rw", fakeDisk).getOrThrow()
+        fs.mounts.mount("/rw", fakeDisk).getOrThrow()
         fs.createDir("/rw/sub").getOrThrow()
-        fs.unmount("/rw").getOrThrow()
+        fs.mounts.unmount("/rw").getOrThrow()
 
         // 以只读重新挂载
-        fs.mount("/rw", fakeDisk, MountOptions(readOnly = true)).getOrThrow()
+        fs.mounts.mount("/rw", fakeDisk, MountOptions(readOnly = true)).getOrThrow()
         val result = fs.readDir("/rw/sub")
         assertTrue(result.isSuccess)
     }
@@ -75,7 +75,7 @@ class MountTest {
     @Test
     fun delete_mountpoint_fails() = runTest {
         val fs = createFs()
-        fs.mount("/mnt", FakeDiskFileOperations()).getOrThrow()
+        fs.mounts.mount("/mnt", FakeDiskFileOperations()).getOrThrow()
         val result = fs.delete("/mnt")
         assertTrue(result.isFailure)
         assertIs<FsError.PermissionDenied>(result.exceptionOrNull())
@@ -88,15 +88,15 @@ class MountTest {
         // fs1: 挂载 /mnt，持久化保存挂载信息
         val fs1 = createFs(storage)
         val fakeDisk = FakeDiskFileOperations()
-        fs1.mount("/mnt", fakeDisk).getOrThrow()
-        assertEquals(listOf("/mnt"), fs1.listMounts())
+        fs1.mounts.mount("/mnt", fakeDisk).getOrThrow()
+        assertEquals(listOf("/mnt"), fs1.mounts.list())
 
         // fs2: 使用同一个 storage，不手动 mount
         val fs2 = createFs(storage)
         // 活跃挂载为空（没重新 mount）
-        assertTrue(fs2.listMounts().isEmpty())
+        assertTrue(fs2.mounts.list().isEmpty())
         // pending 中应该有 /mnt
-        val pending = fs2.pendingMounts()
+        val pending = fs2.mounts.pending()
         assertEquals(1, pending.size)
         assertEquals("/mnt", pending[0].virtualPath)
         assertEquals("/fake", pending[0].rootPath)
@@ -108,10 +108,10 @@ class MountTest {
         val storage = InMemoryFsStorage()
 
         val fs1 = createFs(storage)
-        fs1.mount("/ro", FakeDiskFileOperations(), MountOptions(readOnly = true)).getOrThrow()
+        fs1.mounts.mount("/ro", FakeDiskFileOperations(), MountOptions(readOnly = true)).getOrThrow()
 
         val fs2 = createFs(storage)
-        val pending = fs2.pendingMounts()
+        val pending = fs2.mounts.pending()
         assertEquals(1, pending.size)
         assertTrue(pending[0].readOnly)
     }
@@ -121,14 +121,14 @@ class MountTest {
         val storage = InMemoryFsStorage()
 
         val fs1 = createFs(storage)
-        fs1.mount("/mnt", FakeDiskFileOperations()).getOrThrow()
+        fs1.mounts.mount("/mnt", FakeDiskFileOperations()).getOrThrow()
 
         val fs2 = createFs(storage)
-        assertEquals(1, fs2.pendingMounts().size)
+        assertEquals(1, fs2.mounts.pending().size)
 
         // 重新挂载后 pending 应该清除
-        fs2.mount("/mnt", FakeDiskFileOperations()).getOrThrow()
-        assertTrue(fs2.pendingMounts().isEmpty())
-        assertEquals(listOf("/mnt"), fs2.listMounts())
+        fs2.mounts.mount("/mnt", FakeDiskFileOperations()).getOrThrow()
+        assertTrue(fs2.mounts.pending().isEmpty())
+        assertEquals(listOf("/mnt"), fs2.mounts.list())
     }
 }

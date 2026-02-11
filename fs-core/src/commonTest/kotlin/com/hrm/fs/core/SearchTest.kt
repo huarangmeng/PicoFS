@@ -20,7 +20,7 @@ class SearchTest {
         fs.writeAll("/docs/notes.txt", "world".encodeToByteArray())
         fs.writeAll("/src/main.kt", "code".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(namePattern = "readme.txt")).getOrThrow()
+        val results = fs.search.find(SearchQuery(namePattern = "readme.txt")).getOrThrow()
         assertEquals(1, results.size)
         assertEquals("/docs/readme.txt", results[0].path)
         assertEquals(FsType.FILE, results[0].type)
@@ -34,7 +34,7 @@ class SearchTest {
         fs.writeAll("/c.md", "3".encodeToByteArray())
         fs.writeAll("/dir/d.txt", "4".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(namePattern = "*.txt")).getOrThrow()
+        val results = fs.search.find(SearchQuery(namePattern = "*.txt")).getOrThrow()
         assertEquals(3, results.size)
         assertTrue(results.any { it.path == "/a.txt" })
         assertTrue(results.any { it.path == "/b.txt" })
@@ -49,7 +49,7 @@ class SearchTest {
         fs.writeAll("/ab.txt", "x".encodeToByteArray())
         fs.writeAll("/abc.txt", "x".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(namePattern = "a?.txt")).getOrThrow()
+        val results = fs.search.find(SearchQuery(namePattern = "a?.txt")).getOrThrow()
         assertEquals(3, results.size)
         assertTrue(results.any { it.path == "/a1.txt" })
         assertTrue(results.any { it.path == "/a2.txt" })
@@ -62,7 +62,7 @@ class SearchTest {
         fs.writeAll("/README.md", "x".encodeToByteArray())
         fs.writeAll("/readme.txt", "x".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(namePattern = "readme*", caseSensitive = false)).getOrThrow()
+        val results = fs.search.find(SearchQuery(namePattern = "readme*", caseSensitive = false)).getOrThrow()
         assertEquals(2, results.size)
     }
 
@@ -72,7 +72,7 @@ class SearchTest {
         fs.writeAll("/README.md", "x".encodeToByteArray())
         fs.writeAll("/readme.txt", "x".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(namePattern = "README*", caseSensitive = true)).getOrThrow()
+        val results = fs.search.find(SearchQuery(namePattern = "README*", caseSensitive = true)).getOrThrow()
         assertEquals(1, results.size)
         assertEquals("/README.md", results[0].path)
     }
@@ -87,7 +87,7 @@ class SearchTest {
         fs.createDirRecursive("/a/b/c")
         fs.writeAll("/a/file.txt", "x".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(rootPath = "/a", typeFilter = FsType.DIRECTORY)).getOrThrow()
+        val results = fs.search.find(SearchQuery(rootPath = "/a", typeFilter = FsType.DIRECTORY)).getOrThrow()
         assertTrue(results.all { it.type == FsType.DIRECTORY })
         assertTrue(results.any { it.path == "/a/b" })
         assertTrue(results.any { it.path == "/a/b/c" })
@@ -100,7 +100,7 @@ class SearchTest {
         fs.writeAll("/a/file1.txt", "x".encodeToByteArray())
         fs.writeAll("/a/b/file2.txt", "y".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(rootPath = "/a", typeFilter = FsType.FILE)).getOrThrow()
+        val results = fs.search.find(SearchQuery(rootPath = "/a", typeFilter = FsType.FILE)).getOrThrow()
         assertEquals(2, results.size)
         assertTrue(results.all { it.type == FsType.FILE })
     }
@@ -115,7 +115,7 @@ class SearchTest {
         fs.writeAll("/a.txt", "hello world\nfoo bar\nhello again".encodeToByteArray())
         fs.writeAll("/b.txt", "nothing here".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(contentPattern = "hello")).getOrThrow()
+        val results = fs.search.find(SearchQuery(contentPattern = "hello")).getOrThrow()
         assertEquals(1, results.size)
         assertEquals("/a.txt", results[0].path)
         assertEquals(2, results[0].matchedLines.size)
@@ -130,7 +130,7 @@ class SearchTest {
         val fs = createFs()
         fs.writeAll("/a.txt", "Hello World\nHELLO\nhello".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(contentPattern = "hello", caseSensitive = false)).getOrThrow()
+        val results = fs.search.find(SearchQuery(contentPattern = "hello", caseSensitive = false)).getOrThrow()
         assertEquals(1, results.size)
         assertEquals(3, results[0].matchedLines.size)
     }
@@ -140,7 +140,7 @@ class SearchTest {
         val fs = createFs()
         fs.writeAll("/a.txt", "Hello World\nHELLO\nhello".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(contentPattern = "hello", caseSensitive = true)).getOrThrow()
+        val results = fs.search.find(SearchQuery(contentPattern = "hello", caseSensitive = true)).getOrThrow()
         assertEquals(1, results.size)
         assertEquals(1, results[0].matchedLines.size)
         assertEquals(3, results[0].matchedLines[0].lineNumber)
@@ -153,7 +153,7 @@ class SearchTest {
         fs.writeAll("/b.kt", "val x = 1".encodeToByteArray())
         fs.writeAll("/c.txt", "fun test() {}".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(namePattern = "*.kt", contentPattern = "fun")).getOrThrow()
+        val results = fs.search.find(SearchQuery(namePattern = "*.kt", contentPattern = "fun")).getOrThrow()
         assertEquals(1, results.size)
         assertEquals("/a.kt", results[0].path)
     }
@@ -169,7 +169,7 @@ class SearchTest {
         fs.writeAll("/sub/b.txt", "x".encodeToByteArray())
         fs.writeAll("/sub/deep/c.txt", "x".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(namePattern = "*.txt", maxDepth = 1)).getOrThrow()
+        val results = fs.search.find(SearchQuery(namePattern = "*.txt", maxDepth = 1)).getOrThrow()
         assertEquals(1, results.size)
         assertEquals("/a.txt", results[0].path)
     }
@@ -181,7 +181,7 @@ class SearchTest {
         fs.writeAll("/sub/b.txt", "x".encodeToByteArray())
         fs.writeAll("/sub/deep/c.txt", "x".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(namePattern = "*.txt", maxDepth = 2)).getOrThrow()
+        val results = fs.search.find(SearchQuery(namePattern = "*.txt", maxDepth = 2)).getOrThrow()
         assertEquals(2, results.size)
         assertTrue(results.any { it.path == "/a.txt" })
         assertTrue(results.any { it.path == "/sub/b.txt" })
@@ -195,7 +195,7 @@ class SearchTest {
         fs.writeAll("/sub/deep/c.txt", "x".encodeToByteArray())
         fs.writeAll("/sub/deep/deeper/d.txt", "x".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(namePattern = "*.txt")).getOrThrow()
+        val results = fs.search.find(SearchQuery(namePattern = "*.txt")).getOrThrow()
         assertEquals(4, results.size)
     }
 
@@ -210,7 +210,7 @@ class SearchTest {
         fs.writeAll("/docs/sub/b.txt", "x".encodeToByteArray())
         fs.writeAll("/src/c.txt", "x".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(rootPath = "/docs", namePattern = "*.txt")).getOrThrow()
+        val results = fs.search.find(SearchQuery(rootPath = "/docs", namePattern = "*.txt")).getOrThrow()
         assertEquals(2, results.size)
         assertTrue(results.all { it.path.startsWith("/docs") })
     }
@@ -227,9 +227,9 @@ class SearchTest {
         diskOps.files["/docs/guide.txt"] = "world".encodeToByteArray()
         diskOps.dirs.add("/docs")
 
-        fs.mount("/mnt", diskOps)
+        fs.mounts.mount("/mnt", diskOps)
 
-        val results = fs.find(SearchQuery(namePattern = "*.txt")).getOrThrow()
+        val results = fs.search.find(SearchQuery(namePattern = "*.txt")).getOrThrow()
         assertTrue(results.any { it.path == "/mnt/readme.txt" })
         assertTrue(results.any { it.path == "/mnt/docs/guide.txt" })
     }
@@ -241,9 +241,9 @@ class SearchTest {
         diskOps.files["/hello.txt"] = "greeting: hello world".encodeToByteArray()
         diskOps.files["/other.txt"] = "nothing special".encodeToByteArray()
 
-        fs.mount("/mnt", diskOps)
+        fs.mounts.mount("/mnt", diskOps)
 
-        val results = fs.find(SearchQuery(contentPattern = "hello")).getOrThrow()
+        val results = fs.search.find(SearchQuery(contentPattern = "hello")).getOrThrow()
         assertEquals(1, results.size)
         assertEquals("/mnt/hello.txt", results[0].path)
         assertEquals(1, results[0].matchedLines.size)
@@ -256,9 +256,9 @@ class SearchTest {
 
         val diskOps = FakeDiskFileOperations()
         diskOps.files["/b.txt"] = "hello from disk".encodeToByteArray()
-        fs.mount("/disk", diskOps)
+        fs.mounts.mount("/disk", diskOps)
 
-        val results = fs.find(SearchQuery(contentPattern = "hello")).getOrThrow()
+        val results = fs.search.find(SearchQuery(contentPattern = "hello")).getOrThrow()
         assertEquals(2, results.size)
         assertTrue(results.any { it.path == "/mem/a.txt" })
         assertTrue(results.any { it.path == "/disk/b.txt" })
@@ -273,14 +273,14 @@ class SearchTest {
         val fs = createFs()
         fs.writeAll("/a.txt", "hello".encodeToByteArray())
 
-        val results = fs.find(SearchQuery(namePattern = "*.md")).getOrThrow()
+        val results = fs.search.find(SearchQuery(namePattern = "*.md")).getOrThrow()
         assertTrue(results.isEmpty())
     }
 
     @Test
     fun `find in nonexistent directory returns empty`() = runTest {
         val fs = createFs()
-        val results = fs.find(SearchQuery(rootPath = "/nonexistent", namePattern = "*")).getOrThrow()
+        val results = fs.search.find(SearchQuery(rootPath = "/nonexistent", namePattern = "*")).getOrThrow()
         assertTrue(results.isEmpty())
     }
 
@@ -290,7 +290,7 @@ class SearchTest {
         fs.writeAll("/a.txt", "x".encodeToByteArray())
         fs.createDir("/sub")
 
-        val results = fs.find(SearchQuery()).getOrThrow()
+        val results = fs.search.find(SearchQuery()).getOrThrow()
         // root + a.txt + sub = 3
         assertTrue(results.size >= 3)
     }
@@ -301,7 +301,7 @@ class SearchTest {
         val data = "hello world".encodeToByteArray()
         fs.writeAll("/test.txt", data)
 
-        val results = fs.find(SearchQuery(namePattern = "test.txt")).getOrThrow()
+        val results = fs.search.find(SearchQuery(namePattern = "test.txt")).getOrThrow()
         assertEquals(1, results.size)
         assertEquals(data.size.toLong(), results[0].size)
     }
@@ -311,7 +311,7 @@ class SearchTest {
         val fs = createFs()
         fs.createFile("/empty.txt")
 
-        val results = fs.find(SearchQuery(contentPattern = "hello")).getOrThrow()
+        val results = fs.search.find(SearchQuery(contentPattern = "hello")).getOrThrow()
         assertTrue(results.isEmpty())
     }
 
@@ -319,10 +319,10 @@ class SearchTest {
     fun `find with symlink`() = runTest {
         val fs = createFs()
         fs.writeAll("/real.txt", "target content".encodeToByteArray())
-        fs.createSymlink("/link.txt", "/real.txt")
+        fs.symlinks.create("/link.txt", "/real.txt")
 
         // Symlinks are not returned when typeFilter is FILE (symlink resolves to file but type is SYMLINK)
-        val allResults = fs.find(SearchQuery(namePattern = "*.txt")).getOrThrow()
+        val allResults = fs.search.find(SearchQuery(namePattern = "*.txt")).getOrThrow()
         assertTrue(allResults.any { it.path == "/real.txt" })
     }
 }

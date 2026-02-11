@@ -71,11 +71,11 @@ class CrashRecoveryTest {
         val cfg = PersistenceConfig(autoSnapshotEvery = 1)
         val fs1 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         fs1.writeAll("/f.txt", "data".encodeToByteArray()).getOrThrow()
-        fs1.mount("/mnt", FakeDiskFileOperations()).getOrThrow()
+        fs1.mounts.mount("/mnt", FakeDiskFileOperations()).getOrThrow()
         storage.write("vfs_mounts.json", "NOT_JSON!!!".encodeToByteArray())
         val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         assertEquals("data", fs2.readAll("/f.txt").getOrThrow().decodeToString())
-        assertTrue(fs2.pendingMounts().isEmpty())
+        assertTrue(fs2.mounts.pending().isEmpty())
     }
 
     @Test
@@ -88,7 +88,7 @@ class CrashRecoveryTest {
         storage.write("vfs_versions.json", "CORRUPT".encodeToByteArray())
         val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         assertEquals("v2", fs2.readAll("/f.txt").getOrThrow().decodeToString())
-        assertTrue(fs2.fileVersions("/f.txt").getOrThrow().isEmpty())
+        assertTrue(fs2.versions.list("/f.txt").getOrThrow().isEmpty())
     }
 
     @Test

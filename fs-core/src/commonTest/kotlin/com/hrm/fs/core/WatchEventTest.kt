@@ -18,7 +18,7 @@ class WatchEventTest {
 
         // 先启动监听，确保 collector 已准备好
         val job = launch {
-            fs.watch("/docs").collect { events.add(it) }
+            fs.observe.watch("/docs").collect { events.add(it) }
         }
         testScheduler.advanceUntilIdle()
 
@@ -44,7 +44,7 @@ class WatchEventTest {
         val events = mutableListOf<FsEvent>()
 
         val job = launch {
-            fs.watch("/a").collect { events.add(it) }
+            fs.observe.watch("/a").collect { events.add(it) }
         }
         testScheduler.advanceUntilIdle()
 
@@ -75,11 +75,11 @@ class WatchEventTest {
         val watchScope = CoroutineScope(SupervisorJob() + dispatcher)
         val fs = InMemoryFileSystem(watcherScope = watchScope)
         val diskOps = FakeWatchableDiskOps()
-        fs.mount("/ext", diskOps).getOrThrow()
+        fs.mounts.mount("/ext", diskOps).getOrThrow()
 
         val events = mutableListOf<FsEvent>()
         val collector = launch(dispatcher) {
-            fs.watch("/ext").collect { events.add(it) }
+            fs.observe.watch("/ext").collect { events.add(it) }
         }
 
         diskOps.externalEvents.tryEmit(DiskFileEvent("/newfile.txt", FsEventKind.CREATED))
@@ -102,15 +102,15 @@ class WatchEventTest {
         val watchScope = CoroutineScope(SupervisorJob() + dispatcher)
         val fs = InMemoryFileSystem(watcherScope = watchScope)
         val diskOps = FakeWatchableDiskOps()
-        fs.mount("/ext", diskOps).getOrThrow()
+        fs.mounts.mount("/ext", diskOps).getOrThrow()
 
         val events = mutableListOf<FsEvent>()
         val collector = launch(dispatcher) {
-            fs.watch("/ext").collect { events.add(it) }
+            fs.observe.watch("/ext").collect { events.add(it) }
         }
 
         // 卸载后事件应不再转发
-        fs.unmount("/ext").getOrThrow()
+        fs.mounts.unmount("/ext").getOrThrow()
 
         diskOps.externalEvents.tryEmit(DiskFileEvent("/after.txt", FsEventKind.CREATED))
 
@@ -126,7 +126,7 @@ class WatchEventTest {
         val fs = createFs()
         fs.createDir("/local").getOrThrow()
 
-        val result = fs.sync("/local")
+        val result = fs.mounts.sync("/local")
         assertTrue(result.isFailure)
         assertIs<FsError.NotMounted>(result.exceptionOrNull())
     }
@@ -135,13 +135,13 @@ class WatchEventTest {
     fun sync_returns_events_for_mounted_path() = runTest {
         val fs = createFs()
         val diskOps = FakeDiskFileOperations()
-        fs.mount("/mnt", diskOps).getOrThrow()
+        fs.mounts.mount("/mnt", diskOps).getOrThrow()
 
         // 模拟外部直接在磁盘添加文件
         diskOps.files["/a.txt"] = "hello".encodeToByteArray()
         diskOps.files["/b.txt"] = "world".encodeToByteArray()
 
-        val events = fs.sync("/mnt").getOrThrow()
+        val events = fs.mounts.sync("/mnt").getOrThrow()
         assertTrue(events.isNotEmpty())
         val paths = events.map { it.path }.toSet()
         assertTrue("/mnt/a.txt" in paths)

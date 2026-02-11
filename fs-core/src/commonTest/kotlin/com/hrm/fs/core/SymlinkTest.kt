@@ -12,9 +12,9 @@ class SymlinkTest {
     fun symlink_create_and_readLink() = runTest {
         val fs = createFs()
         fs.writeAll("/target.txt", "hello".encodeToByteArray()).getOrThrow()
-        fs.createSymlink("/link.txt", "/target.txt").getOrThrow()
+        fs.symlinks.create("/link.txt", "/target.txt").getOrThrow()
 
-        val target = fs.readLink("/link.txt").getOrThrow()
+        val target = fs.symlinks.readLink("/link.txt").getOrThrow()
         assertEquals("/target.txt", target)
     }
 
@@ -22,7 +22,7 @@ class SymlinkTest {
     fun symlink_stat_follows_to_target() = runTest {
         val fs = createFs()
         fs.writeAll("/target.txt", "hello".encodeToByteArray()).getOrThrow()
-        fs.createSymlink("/link.txt", "/target.txt").getOrThrow()
+        fs.symlinks.create("/link.txt", "/target.txt").getOrThrow()
 
         // stat 跟随 symlink，返回目标文件信息
         val meta = fs.stat("/link.txt").getOrThrow()
@@ -34,7 +34,7 @@ class SymlinkTest {
     fun symlink_read_through_link() = runTest {
         val fs = createFs()
         fs.writeAll("/real.txt", "content via symlink".encodeToByteArray()).getOrThrow()
-        fs.createSymlink("/alias.txt", "/real.txt").getOrThrow()
+        fs.symlinks.create("/alias.txt", "/real.txt").getOrThrow()
 
         // 通过 symlink 读取
         val data = fs.readAll("/alias.txt").getOrThrow().decodeToString()
@@ -45,7 +45,7 @@ class SymlinkTest {
     fun symlink_write_through_link() = runTest {
         val fs = createFs()
         fs.writeAll("/real.txt", "old".encodeToByteArray()).getOrThrow()
-        fs.createSymlink("/alias.txt", "/real.txt").getOrThrow()
+        fs.symlinks.create("/alias.txt", "/real.txt").getOrThrow()
 
         // 通过 symlink 写入
         fs.writeAll("/alias.txt", "new content".encodeToByteArray()).getOrThrow()
@@ -60,7 +60,7 @@ class SymlinkTest {
         val fs = createFs()
         fs.createDirRecursive("/real/sub").getOrThrow()
         fs.writeAll("/real/sub/f.txt", "data".encodeToByteArray()).getOrThrow()
-        fs.createSymlink("/link_dir", "/real").getOrThrow()
+        fs.symlinks.create("/link_dir", "/real").getOrThrow()
 
         // 通过 symlink 目录读取子内容
         val entries = fs.readDir("/link_dir").getOrThrow()
@@ -76,7 +76,7 @@ class SymlinkTest {
         val fs = createFs()
         fs.createDir("/d").getOrThrow()
         fs.writeAll("/d/real.txt", "data".encodeToByteArray()).getOrThrow()
-        fs.createSymlink("/d/link.txt", "/d/real.txt").getOrThrow()
+        fs.symlinks.create("/d/link.txt", "/d/real.txt").getOrThrow()
 
         // readDir 应展示 symlink 的实际类型
         val entries = fs.readDir("/d").getOrThrow()
@@ -88,7 +88,7 @@ class SymlinkTest {
     @Test
     fun symlink_dangling_stat_fails() = runTest {
         val fs = createFs()
-        fs.createSymlink("/dangling", "/nonexistent").getOrThrow()
+        fs.symlinks.create("/dangling", "/nonexistent").getOrThrow()
 
         // 悬空链接的 stat 应失败（目标不存在）
         val result = fs.stat("/dangling")
@@ -96,7 +96,7 @@ class SymlinkTest {
         assertIs<FsError.NotFound>(result.exceptionOrNull())
 
         // 但 readLink 仍可读取目标路径
-        val target = fs.readLink("/dangling").getOrThrow()
+        val target = fs.symlinks.readLink("/dangling").getOrThrow()
         assertEquals("/nonexistent", target)
     }
 
@@ -104,10 +104,10 @@ class SymlinkTest {
     fun symlink_already_exists_fails() = runTest {
         val fs = createFs()
         fs.writeAll("/target.txt", "data".encodeToByteArray()).getOrThrow()
-        fs.createSymlink("/link.txt", "/target.txt").getOrThrow()
+        fs.symlinks.create("/link.txt", "/target.txt").getOrThrow()
 
         // 重复创建应失败
-        val result = fs.createSymlink("/link.txt", "/other.txt")
+        val result = fs.symlinks.create("/link.txt", "/other.txt")
         assertTrue(result.isFailure)
         assertIs<FsError.AlreadyExists>(result.exceptionOrNull())
     }
@@ -116,7 +116,7 @@ class SymlinkTest {
     fun symlink_delete_removes_link_not_target() = runTest {
         val fs = createFs()
         fs.writeAll("/target.txt", "survive".encodeToByteArray()).getOrThrow()
-        fs.createSymlink("/link.txt", "/target.txt").getOrThrow()
+        fs.symlinks.create("/link.txt", "/target.txt").getOrThrow()
 
         // 删除 symlink
         fs.delete("/link.txt").getOrThrow()
@@ -133,8 +133,8 @@ class SymlinkTest {
     fun symlink_chain() = runTest {
         val fs = createFs()
         fs.writeAll("/real.txt", "chain".encodeToByteArray()).getOrThrow()
-        fs.createSymlink("/link1", "/real.txt").getOrThrow()
-        fs.createSymlink("/link2", "/link1").getOrThrow()
+        fs.symlinks.create("/link1", "/real.txt").getOrThrow()
+        fs.symlinks.create("/link2", "/link1").getOrThrow()
 
         // 跟随链：link2 -> link1 -> real.txt
         val data = fs.readAll("/link2").getOrThrow().decodeToString()
@@ -147,7 +147,7 @@ class SymlinkTest {
         fs.createDir("/a").getOrThrow()
         fs.writeAll("/a/target.txt", "relative".encodeToByteArray()).getOrThrow()
         // 相对路径 symlink（相对于 /a 目录）
-        fs.createSymlink("/a/link.txt", "target.txt").getOrThrow()
+        fs.symlinks.create("/a/link.txt", "target.txt").getOrThrow()
 
         val data = fs.readAll("/a/link.txt").getOrThrow().decodeToString()
         assertEquals("relative", data)
@@ -160,11 +160,11 @@ class SymlinkTest {
 
         val fs1 = InMemoryFileSystem(storage = storage, persistenceConfig = persistCfg)
         fs1.writeAll("/target.txt", "persisted".encodeToByteArray()).getOrThrow()
-        fs1.createSymlink("/link.txt", "/target.txt").getOrThrow()
+        fs1.symlinks.create("/link.txt", "/target.txt").getOrThrow()
 
         // 使用相同 storage 创建新实例，symlink 应通过持久化保留
         val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = persistCfg)
-        val target = fs2.readLink("/link.txt").getOrThrow()
+        val target = fs2.symlinks.readLink("/link.txt").getOrThrow()
         assertEquals("/target.txt", target)
 
         val data = fs2.readAll("/link.txt").getOrThrow().decodeToString()
@@ -177,7 +177,7 @@ class SymlinkTest {
         fs.writeAll("/f.txt", "data".encodeToByteArray()).getOrThrow()
 
         // 对普通文件调用 readLink 应失败
-        val result = fs.readLink("/f.txt")
+        val result = fs.symlinks.readLink("/f.txt")
         assertTrue(result.isFailure)
         assertIs<FsError.InvalidPath>(result.exceptionOrNull())
     }
@@ -187,7 +187,7 @@ class SymlinkTest {
         val fs = createFs()
         fs.createDir("/real_dir").getOrThrow()
         fs.writeAll("/real_dir/f.txt", "keep".encodeToByteArray()).getOrThrow()
-        fs.createSymlink("/link_dir", "/real_dir").getOrThrow()
+        fs.symlinks.create("/link_dir", "/real_dir").getOrThrow()
 
         // deleteRecursive 删除 symlink 本身，不跟随到目标目录
         fs.deleteRecursive("/link_dir").getOrThrow()
@@ -198,7 +198,7 @@ class SymlinkTest {
         assertEquals("keep", data)
 
         // symlink 已删除
-        assertTrue(fs.readLink("/link_dir").isFailure)
+        assertTrue(fs.symlinks.readLink("/link_dir").isFailure)
     }
 
     @Test
@@ -207,11 +207,11 @@ class SymlinkTest {
         fs.createDir("/d").getOrThrow()
         val events = mutableListOf<FsEvent>()
         val job = launch {
-            fs.watch("/d").collect { events.add(it) }
+            fs.observe.watch("/d").collect { events.add(it) }
         }
         testScheduler.advanceUntilIdle()
 
-        fs.createSymlink("/d/link", "/target").getOrThrow()
+        fs.symlinks.create("/d/link", "/target").getOrThrow()
         testScheduler.advanceUntilIdle()
 
         assertTrue(events.any { it.kind == FsEventKind.CREATED && it.path == "/d/link" })

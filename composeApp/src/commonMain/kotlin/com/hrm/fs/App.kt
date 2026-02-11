@@ -67,7 +67,7 @@ fun App(diskOps: DiskFileOperations? = null) {
         // 自动挂载
         LaunchedEffect(diskOps) {
             if (diskOps != null && !mounted) {
-                fs.mount("/disk", diskOps).fold(
+                fs.mounts.mount("/disk", diskOps).fold(
                     { mounted = true },
                     { snackbar.showSnackbar("挂载失败: ${it.message}") }
                 )
