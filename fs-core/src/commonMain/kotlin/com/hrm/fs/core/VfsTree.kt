@@ -573,6 +573,8 @@ internal class VfsTree {
 
                 is WalEntry.SetXattr -> setXattrInternal(entry.path, entry.name, entry.value)
                 is WalEntry.RemoveXattr -> removeXattrInternal(entry.path, entry.name)
+                is WalEntry.MoveToTrash -> { deleteRecursiveInternal(entry.path) }
+                is WalEntry.RestoreFromTrash -> { /* tree 变更由 restore 后的操作完成 */ }
             }
         }
     }
@@ -712,6 +714,31 @@ internal class VfsTree {
         }
         parentNode.children.remove(name)
         parentNode.modifiedAtMillis = nowMillis()
+    }
+
+    private fun deleteRecursiveInternal(path: String) {
+        val normalized = PathUtils.normalize(path)
+        if (normalized == "/") return
+        val (parent, name) = splitParent(normalized)
+        val parentNode = resolveNode(parent) as? DirNode ?: return
+        val node = parentNode.children[name] ?: return
+        if (node is DirNode) {
+            subtractUsedBytes(node)
+        } else if (node is FileNode) {
+            _usedBytes -= node.size.toLong()
+        }
+        parentNode.children.remove(name)
+        parentNode.modifiedAtMillis = nowMillis()
+    }
+
+    private fun subtractUsedBytes(dir: DirNode) {
+        for (child in dir.children.values) {
+            when (child) {
+                is FileNode -> _usedBytes -= child.size.toLong()
+                is DirNode -> subtractUsedBytes(child)
+                is SymlinkNode -> {}
+            }
+        }
     }
 
     private fun writeInternal(path: String, offset: Long, data: ByteArray) {

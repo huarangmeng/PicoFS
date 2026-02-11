@@ -213,6 +213,9 @@ interface FileSystem {
 
     /** 归档压缩：compress / extract / list */
     val archive: FsArchive
+
+    /** 回收站：moveToTrash / restore / list / purge / purgeAll */
+    val trash: FsTrash
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -419,6 +422,51 @@ interface FsArchive {
     ): Result<List<ArchiveEntry>>
 }
 
+/**
+ * 回收站（软删除 + 恢复机制）。
+ *
+ * 删除的文件/目录进入回收站而非永久删除，可随时恢复或彻底清除。
+ * 每个回收站条目记录原始路径、删除时间和唯一 ID。
+ */
+interface FsTrash {
+    /**
+     * 将文件/目录移入回收站。
+     *
+     * 对于 VFS 内存文件，内容保存在 TrashManager 中；
+     * 对于挂载点文件，移动到磁盘的 `.trash` 目录中。
+     *
+     * @param path 要删除的虚拟路径
+     * @return 回收站条目 ID
+     */
+    suspend fun moveToTrash(path: String): Result<String>
+
+    /**
+     * 从回收站恢复文件/目录到原始位置。
+     *
+     * 如果原始路径已存在，返回 [FsError.AlreadyExists]。
+     *
+     * @param trashId 回收站条目 ID
+     */
+    suspend fun restore(trashId: String): Result<Unit>
+
+    /**
+     * 列出回收站中的所有条目（最近删除的在前）。
+     */
+    suspend fun list(): Result<List<TrashItem>>
+
+    /**
+     * 彻底删除回收站中的指定条目（不可恢复）。
+     *
+     * @param trashId 回收站条目 ID
+     */
+    suspend fun purge(trashId: String): Result<Unit>
+
+    /**
+     * 清空回收站（彻底删除所有条目）。
+     */
+    suspend fun purgeAll(): Result<Unit>
+}
+
 // ═══════════════════════════════════════════════════════════════
 // 磁盘操作接口
 // ═══════════════════════════════════════════════════════════════
@@ -496,6 +544,44 @@ interface DiskFileOperations {
         format: ArchiveFormat?
     ): Result<List<ArchiveEntry>> =
         Result.failure(FsError.PermissionDenied("archive not supported"))
+
+    // ── 回收站 ─────────────────────────────────────────────────
+
+    /**
+     * 将磁盘文件/目录移入回收站（`.trash` 目录）。
+     *
+     * @param path 磁盘相对路径
+     * @return 回收站条目 ID
+     */
+    suspend fun moveToTrash(path: String): Result<String> =
+        Result.failure(FsError.PermissionDenied("trash not supported"))
+
+    /**
+     * 从磁盘回收站恢复到原始路径。
+     *
+     * @param trashId 回收站条目 ID
+     * @param originalRelativePath 原始磁盘相对路径
+     */
+    suspend fun restoreFromTrash(trashId: String, originalRelativePath: String): Result<Unit> =
+        Result.failure(FsError.PermissionDenied("trash not supported"))
+
+    /**
+     * 列出磁盘回收站中的条目。
+     */
+    suspend fun listTrash(): Result<List<TrashItem>> =
+        Result.failure(FsError.PermissionDenied("trash not supported"))
+
+    /**
+     * 彻底删除磁盘回收站中的指定条目。
+     */
+    suspend fun purgeTrash(trashId: String): Result<Unit> =
+        Result.failure(FsError.PermissionDenied("trash not supported"))
+
+    /**
+     * 清空磁盘回收站。
+     */
+    suspend fun purgeAllTrash(): Result<Unit> =
+        Result.failure(FsError.PermissionDenied("trash not supported"))
 }
 
 /**
@@ -600,6 +686,22 @@ data class ArchiveEntry(
     val size: Long,
     /** 最后修改时间（毫秒时间戳），不可用时为 0。 */
     val modifiedAtMillis: Long = 0
+)
+
+/**
+ * 回收站条目信息。
+ */
+data class TrashItem(
+    /** 回收站条目唯一 ID。 */
+    val trashId: String,
+    /** 文件/目录的原始虚拟路径。 */
+    val originalPath: String,
+    /** 条目类型（文件或目录）。 */
+    val type: FsType,
+    /** 文件大小（字节），目录为子条目总大小。 */
+    val size: Long,
+    /** 删除时间（毫秒时间戳）。 */
+    val deletedAtMillis: Long
 )
 
 // ═══════════════════════════════════════════════════════════════

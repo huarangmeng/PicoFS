@@ -24,6 +24,7 @@ import com.hrm.fs.api.FsSearch
 import com.hrm.fs.api.FsStorage
 import com.hrm.fs.api.FsStreams
 import com.hrm.fs.api.FsSymlinks
+import com.hrm.fs.api.FsTrash
 import com.hrm.fs.api.FsType
 import com.hrm.fs.api.FsVersions
 import com.hrm.fs.api.FsXattr
@@ -35,10 +36,12 @@ import com.hrm.fs.api.PendingMount
 import com.hrm.fs.api.QuotaInfo
 import com.hrm.fs.api.SearchQuery
 import com.hrm.fs.api.SearchResult
+import com.hrm.fs.api.TrashItem
 import com.hrm.fs.api.log.FLog
 import com.hrm.fs.core.VfsMetricsCollector.Op
 import com.hrm.fs.core.persistence.PersistenceConfig
 import com.hrm.fs.core.persistence.SnapshotPermissions
+import com.hrm.fs.core.persistence.SnapshotTrashData
 import com.hrm.fs.core.persistence.WalEntry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -84,6 +87,7 @@ internal class InMemoryFileSystem(
     internal val persistence = VfsPersistenceManager(storage, persistenceConfig)
     internal val mc = VfsMetricsCollector()
     internal val versionManager = VfsVersionManager()
+    internal val trashManager = VfsTrashManager()
     internal val fileLockManager = VfsFileLockManager()
 
     internal val statCache = VfsCache<String, FsMeta>(256)
@@ -105,6 +109,7 @@ internal class InMemoryFileSystem(
     override val xattr: FsXattr = XattrImpl()
     override val symlinks: FsSymlinks = SymlinksImpl()
     override val archive: FsArchive = ArchiveImpl()
+    override val trash: FsTrash = TrashImpl()
 
     // ═══════════════════════════════════════════════════════════
     // 基础 CRUD
@@ -1084,6 +1089,262 @@ internal class InMemoryFileSystem(
     }
 
     // ═══════════════════════════════════════════════════════════
+    // TrashImpl
+    // ═══════════════════════════════════════════════════════════
+
+    private inner class TrashImpl : FsTrash {
+        override suspend fun moveToTrash(path: String): Result<String> {
+            FLog.d(TAG, "trash.moveToTrash: path=$path")
+            return locked {
+                ensureLoaded()
+                val normalized = PathUtils.normalize(path)
+                if (normalized == "/") {
+                    return@locked Result.failure(FsError.PermissionDenied("不能删除根目录"))
+                }
+                if (mountTable.isMountPoint(normalized)) {
+                    return@locked Result.failure(FsError.PermissionDenied("不能删除挂载点: $normalized"))
+                }
+                if (fileLockManager.isLocked(normalized)) {
+                    return@locked Result.failure(FsError.Locked(normalized))
+                }
+
+                val match = mountTable.findMount(normalized)
+                if (match != null) {
+                    // 挂载点文件：委托给 diskOps
+                    if (match.options.readOnly) return@locked readOnlyError(normalized)
+                    val meta = match.diskOps.stat(match.relativePath).getOrNull()
+                    val type = meta?.type ?: FsType.FILE
+                    val diskResult = match.diskOps.moveToTrash(match.relativePath)
+                    if (diskResult.isSuccess) {
+                        val trashId = diskResult.getOrThrow()
+                        trashManager.recordMountedTrash(trashId, normalized, type)
+                        invalidateCache(normalized)
+                        eventBus.emit(normalized, FsEventKind.DELETED)
+                        walAppend(WalEntry.MoveToTrash(normalized, trashId))
+                        persistTrash()
+                    }
+                    return@locked diskResult
+                }
+
+                // VFS 内存文件
+                // 使用 lstat 判断是否为符号链接（不跟随）
+                val lmeta = tree.lstat(normalized).getOrElse {
+                    return@locked Result.failure(it)
+                }
+                val trashId: String
+                when (lmeta.type) {
+                    FsType.FILE -> {
+                        val content = readAllBytes(normalized).getOrElse { ByteArray(0) }
+                        trashId = trashManager.moveToTrash(normalized, FsType.FILE, content)
+                    }
+                    FsType.DIRECTORY -> {
+                        val children = collectChildrenForTrash(normalized)
+                        trashId = trashManager.moveToTrash(normalized, FsType.DIRECTORY, children = children)
+                    }
+                    FsType.SYMLINK -> {
+                        val target = tree.readLink(normalized).getOrNull()
+                        val content = target?.encodeToByteArray()
+                        trashId = trashManager.moveToTrash(normalized, FsType.SYMLINK, content)
+                    }
+                }
+                // 从文件树中删除
+                deleteInternalRecursive(normalized)
+                walAppend(WalEntry.MoveToTrash(normalized, trashId))
+                persistTrash()
+                eventBus.emit(normalized, FsEventKind.DELETED)
+                FLog.i(TAG, "trash.moveToTrash success: path=$normalized, trashId=$trashId")
+                Result.success(trashId)
+            }
+        }
+
+        override suspend fun restore(trashId: String): Result<Unit> {
+            FLog.d(TAG, "trash.restore: trashId=$trashId")
+            return locked {
+                ensureLoaded()
+                val entry = trashManager.getEntry(trashId)
+                    ?: return@locked Result.failure(FsError.NotFound("trash entry: $trashId"))
+                val originalPath = entry.originalPath
+
+                // 检查原始路径是否已存在（lstat 检查包括符号链接）
+                val existsByStat = statInternal(originalPath).isSuccess
+                val existsByLstat = tree.lstat(originalPath).isSuccess
+                if (existsByStat || existsByLstat) {
+                    return@locked Result.failure(FsError.AlreadyExists(originalPath))
+                }
+
+                if (entry.isMounted) {
+                    // 挂载点文件：委托给 diskOps
+                    val match = mountTable.findMount(originalPath)
+                        ?: return@locked Result.failure(FsError.NotMounted(originalPath))
+                    val diskResult = match.diskOps.restoreFromTrash(trashId, match.relativePath)
+                    if (diskResult.isSuccess) {
+                        trashManager.remove(trashId)
+                        invalidateCache(originalPath)
+                        eventBus.emit(originalPath, FsEventKind.CREATED)
+                        walAppend(WalEntry.RestoreFromTrash(trashId, originalPath))
+                        persistTrash()
+                    }
+                    return@locked diskResult
+                }
+
+                // VFS 内存文件恢复
+                val parentPath = originalPath.substringBeforeLast('/', "/")
+                if (parentPath != "/") {
+                    tree.ensureDirPath(parentPath)
+                }
+
+                when (entry.type) {
+                    FsType.FILE -> {
+                        tree.createFile(originalPath).getOrElse { return@locked Result.failure(it) }
+                        if (entry.content != null && entry.content.isNotEmpty()) {
+                            val node = tree.resolveNode(originalPath) as? FileNode
+                            if (node != null) {
+                                node.blocks.write(0, entry.content)
+                                node.modifiedAtMillis = VfsTree.nowMillis()
+                            }
+                        }
+                    }
+                    FsType.DIRECTORY -> {
+                        tree.createDir(originalPath).getOrElse { return@locked Result.failure(it) }
+                        if (entry.children != null) {
+                            restoreChildrenFromTrash(originalPath, entry.children)
+                        }
+                    }
+                    FsType.SYMLINK -> {
+                        val target = entry.content?.decodeToString() ?: ""
+                        tree.createSymlink(originalPath, target).getOrElse { return@locked Result.failure(it) }
+                    }
+                }
+
+                trashManager.remove(trashId)
+                walAppend(WalEntry.RestoreFromTrash(trashId, originalPath))
+                persistTrash()
+                eventBus.emit(originalPath, FsEventKind.CREATED)
+                FLog.i(TAG, "trash.restore success: trashId=$trashId, path=$originalPath")
+                Result.success(Unit)
+            }
+        }
+
+        override suspend fun list(): Result<List<TrashItem>> {
+            return locked {
+                ensureLoaded()
+                Result.success(trashManager.listItems())
+            }
+        }
+
+        override suspend fun purge(trashId: String): Result<Unit> {
+            FLog.d(TAG, "trash.purge: trashId=$trashId")
+            return locked {
+                ensureLoaded()
+                val entry = trashManager.getEntry(trashId)
+                    ?: return@locked Result.failure(FsError.NotFound("trash entry: $trashId"))
+                if (entry.isMounted) {
+                    val match = mountTable.findMount(entry.originalPath)
+                    match?.diskOps?.purgeTrash(trashId)
+                }
+                trashManager.remove(trashId)
+                FLog.d(TAG, "trash.purge success: trashId=$trashId")
+                Result.success(Unit)
+            }
+        }
+
+        override suspend fun purgeAll(): Result<Unit> {
+            FLog.d(TAG, "trash.purgeAll")
+            return locked {
+                ensureLoaded()
+                val all = trashManager.clear()
+                for (entry in all) {
+                    if (entry.isMounted) {
+                        val match = mountTable.findMount(entry.originalPath)
+                        match?.diskOps?.purgeTrash(entry.trashId)
+                    }
+                }
+                FLog.d(TAG, "trash.purgeAll success: purged ${all.size} items")
+                Result.success(Unit)
+            }
+        }
+
+        private fun collectChildrenForTrash(dirPath: String): List<VfsTrashManager.TrashChildEntry> {
+            val result = mutableListOf<VfsTrashManager.TrashChildEntry>()
+            val node = tree.resolveNode(dirPath) as? DirNode ?: return result
+            for ((name, child) in node.children) {
+                val childPath = "$dirPath/$name"
+                when (child) {
+                    is FileNode -> {
+                        result.add(
+                            VfsTrashManager.TrashChildEntry(
+                                relativePath = name,
+                                type = FsType.FILE,
+                                content = child.blocks.toByteArray()
+                            )
+                        )
+                    }
+                    is DirNode -> {
+                        val grandChildren = collectChildrenForTrash(childPath)
+                        result.add(
+                            VfsTrashManager.TrashChildEntry(
+                                relativePath = name,
+                                type = FsType.DIRECTORY,
+                                children = grandChildren
+                            )
+                        )
+                    }
+                    is SymlinkNode -> {
+                        result.add(
+                            VfsTrashManager.TrashChildEntry(
+                                relativePath = name,
+                                type = FsType.SYMLINK,
+                                content = child.targetPath.encodeToByteArray()
+                            )
+                        )
+                    }
+                }
+            }
+            return result
+        }
+
+        private fun restoreChildrenFromTrash(parentPath: String, children: List<VfsTrashManager.TrashChildEntry>) {
+            for (child in children) {
+                val childPath = "$parentPath/${child.relativePath}"
+                when (child.type) {
+                    FsType.FILE -> {
+                        tree.createFile(childPath)
+                        if (child.content != null && child.content.isNotEmpty()) {
+                            val node = tree.resolveNode(childPath) as? FileNode
+                            if (node != null) {
+                                node.blocks.write(0, child.content)
+                                node.modifiedAtMillis = VfsTree.nowMillis()
+                            }
+                        }
+                    }
+                    FsType.DIRECTORY -> {
+                        tree.createDir(childPath)
+                        if (child.children != null) {
+                            restoreChildrenFromTrash(childPath, child.children)
+                        }
+                    }
+                    FsType.SYMLINK -> {
+                        val target = child.content?.decodeToString() ?: ""
+                        tree.createSymlink(childPath, target)
+                    }
+                }
+            }
+        }
+
+        /** 递归删除内存节点（不走 WAL、不走 event）。 */
+        private fun deleteInternalRecursive(path: String) {
+            val node = tree.resolveNode(path) ?: return
+            if (node is DirNode) {
+                val childNames = node.children.keys.toList()
+                for (name in childNames) {
+                    deleteInternalRecursive("$path/$name")
+                }
+            }
+            tree.delete(path)
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
     // Disk Watcher 管理
     // ═══════════════════════════════════════════════════════════
 
@@ -1147,14 +1408,23 @@ internal class InMemoryFileSystem(
             versionManager.restoreFromSnapshot(it.entries)
             FLog.d(TAG, "ensureLoaded: restored version data for ${it.entries.size} files")
         }
+        loadResult.trashData?.let {
+            trashManager.restoreFromSnapshot(it.entries)
+            FLog.d(TAG, "ensureLoaded: restored trash data with ${it.entries.size} entries")
+        }
     }
 
     internal suspend fun walAppend(entry: WalEntry) {
         persistence.appendWal(
             entry,
             snapshotProvider = { tree.toSnapshot() },
-            versionDataProvider = { versionManager.toSnapshotData() }
+            versionDataProvider = { versionManager.toSnapshotData() },
+            trashDataProvider = { SnapshotTrashData(trashManager.toSnapshotEntries()) }
         )
+    }
+
+    private suspend fun persistTrash() {
+        persistence.persistTrash(SnapshotTrashData(trashManager.toSnapshotEntries()))
     }
 
     internal suspend fun <T> locked(block: suspend () -> T): T = mutex.withLock { block() }

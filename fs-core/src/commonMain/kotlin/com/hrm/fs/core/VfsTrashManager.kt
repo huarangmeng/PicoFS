@@ -1,0 +1,226 @@
+package com.hrm.fs.core
+
+import com.hrm.fs.api.FsError
+import com.hrm.fs.api.FsType
+import com.hrm.fs.api.TrashItem
+import com.hrm.fs.api.log.FLog
+import com.hrm.fs.core.persistence.SnapshotTrashEntry
+import kotlin.time.Clock
+
+/**
+ * 回收站管理器。
+ *
+ * 维护已删除文件/目录的元数据和内容，支持恢复和彻底清除。
+ * **无线程安全保证**，外部需自行加锁。
+ *
+ * ## 设计思路
+ *
+ * 1. **VFS 内存文件**：删除时将文件内容和子目录结构完整保存到 trash store。
+ * 2. **挂载点文件**：委托给 `DiskFileOperations.moveToTrash()` 在磁盘 `.trash` 目录中存储。
+ *    TrashManager 仅保存元数据（路径、类型、删除时间），内容由磁盘管理。
+ * 3. **持久化**：通过 snapshot 持久化 trash store，崩溃恢复后可继续使用。
+ */
+internal class VfsTrashManager(
+    /** 回收站最大条目数，超出后自动清除最旧条目。 */
+    val maxItems: Int = DEFAULT_MAX_ITEMS
+) {
+    companion object {
+        const val DEFAULT_MAX_ITEMS = 100
+        private const val TAG = "VfsTrash"
+
+        private var trashCounter: Long = 0
+        internal fun nextTrashId(): String = "trash_${++trashCounter}"
+
+        private fun nowMillis(): Long = Clock.System.now().toEpochMilliseconds()
+    }
+
+    /**
+     * 回收站内部条目（VFS 内存文件包含完整内容）。
+     */
+    internal data class TrashEntry(
+        val trashId: String,
+        val originalPath: String,
+        val type: FsType,
+        val deletedAtMillis: Long,
+        /** 文件内容（仅 VFS 内存文件有值，挂载点文件为 null）。 */
+        val content: ByteArray? = null,
+        /** 目录的子条目列表（仅目录有值）。 */
+        val children: List<TrashChildEntry>? = null,
+        /** 是否为挂载点文件（内容由磁盘管理）。 */
+        val isMounted: Boolean = false
+    ) {
+        val size: Long
+            get() = when {
+                content != null -> content.size.toLong()
+                children != null -> children.sumOf { it.totalSize }
+                else -> 0L
+            }
+    }
+
+    /**
+     * 目录子条目（递归结构）。
+     */
+    internal data class TrashChildEntry(
+        val relativePath: String,
+        val type: FsType,
+        val content: ByteArray? = null,
+        val children: List<TrashChildEntry>? = null
+    ) {
+        val totalSize: Long
+            get() = when {
+                content != null -> content.size.toLong()
+                children != null -> children.sumOf { it.totalSize }
+                else -> 0L
+            }
+    }
+
+    /** trashId → TrashEntry（最新在前插入） */
+    private val store = LinkedHashMap<String, TrashEntry>()
+
+    /**
+     * 将文件移入回收站（VFS 内存文件）。
+     *
+     * @return 回收站条目 ID
+     */
+    fun moveToTrash(
+        originalPath: String,
+        type: FsType,
+        content: ByteArray? = null,
+        children: List<TrashChildEntry>? = null
+    ): String {
+        val trashId = nextTrashId()
+        val entry = TrashEntry(
+            trashId = trashId,
+            originalPath = originalPath,
+            type = type,
+            deletedAtMillis = nowMillis(),
+            content = content?.copyOf(),
+            children = children,
+            isMounted = false
+        )
+        // 插入到头部（最新在前）
+        val newStore = LinkedHashMap<String, TrashEntry>()
+        newStore[trashId] = entry
+        newStore.putAll(store)
+        store.clear()
+        store.putAll(newStore)
+        trimOldest()
+        FLog.d(TAG, "moveToTrash: trashId=$trashId, path=$originalPath, type=$type")
+        return trashId
+    }
+
+    /**
+     * 记录挂载点文件的回收站元数据（内容由 diskOps 管理）。
+     */
+    fun recordMountedTrash(
+        trashId: String,
+        originalPath: String,
+        type: FsType
+    ) {
+        val entry = TrashEntry(
+            trashId = trashId,
+            originalPath = originalPath,
+            type = type,
+            deletedAtMillis = nowMillis(),
+            isMounted = true
+        )
+        val newStore = LinkedHashMap<String, TrashEntry>()
+        newStore[trashId] = entry
+        newStore.putAll(store)
+        store.clear()
+        store.putAll(newStore)
+        trimOldest()
+        FLog.d(TAG, "recordMountedTrash: trashId=$trashId, path=$originalPath")
+    }
+
+    /** 获取回收站条目。 */
+    fun getEntry(trashId: String): TrashEntry? = store[trashId]
+
+    /** 列出所有回收站条目。 */
+    fun listItems(): List<TrashItem> = store.values.map { entry ->
+        TrashItem(
+            trashId = entry.trashId,
+            originalPath = entry.originalPath,
+            type = entry.type,
+            size = entry.size,
+            deletedAtMillis = entry.deletedAtMillis
+        )
+    }
+
+    /** 从回收站移除条目（恢复或清除后调用）。 */
+    fun remove(trashId: String): TrashEntry? {
+        val removed = store.remove(trashId)
+        if (removed != null) {
+            FLog.d(TAG, "remove: trashId=$trashId, path=${removed.originalPath}")
+        }
+        return removed
+    }
+
+    /** 清空所有回收站条目。 */
+    fun clear(): List<TrashEntry> {
+        val all = store.values.toList()
+        store.clear()
+        FLog.d(TAG, "clear: purged ${all.size} items")
+        return all
+    }
+
+    /** 是否为空。 */
+    fun isEmpty(): Boolean = store.isEmpty()
+
+    /** 条目数。 */
+    fun size(): Int = store.size
+
+    private fun trimOldest() {
+        while (store.size > maxItems) {
+            val oldest = store.entries.last()
+            store.remove(oldest.key)
+            FLog.d(TAG, "trimOldest: auto-purged trashId=${oldest.key}")
+        }
+    }
+
+    // ── 快照持久化 ──────────────────────────────────────────────
+
+    fun toSnapshotEntries(): List<SnapshotTrashEntry> = store.values.map { entry ->
+        SnapshotTrashEntry(
+            trashId = entry.trashId,
+            originalPath = entry.originalPath,
+            type = entry.type.name,
+            deletedAtMillis = entry.deletedAtMillis,
+            content = entry.content,
+            children = entry.children?.map { childToSnapshot(it) },
+            isMounted = entry.isMounted
+        )
+    }
+
+    fun restoreFromSnapshot(entries: List<SnapshotTrashEntry>) {
+        store.clear()
+        for (e in entries) {
+            store[e.trashId] = TrashEntry(
+                trashId = e.trashId,
+                originalPath = e.originalPath,
+                type = FsType.valueOf(e.type),
+                deletedAtMillis = e.deletedAtMillis,
+                content = e.content,
+                children = e.children?.map { childFromSnapshot(it) },
+                isMounted = e.isMounted
+            )
+        }
+        FLog.d(TAG, "restoreFromSnapshot: restored ${entries.size} trash entries")
+    }
+
+    private fun childToSnapshot(child: TrashChildEntry): SnapshotTrashEntry.SnapshotTrashChild =
+        SnapshotTrashEntry.SnapshotTrashChild(
+            relativePath = child.relativePath,
+            type = child.type.name,
+            content = child.content,
+            children = child.children?.map { childToSnapshot(it) }
+        )
+
+    private fun childFromSnapshot(child: SnapshotTrashEntry.SnapshotTrashChild): TrashChildEntry =
+        TrashChildEntry(
+            relativePath = child.relativePath,
+            type = FsType.valueOf(child.type),
+            content = child.content,
+            children = child.children?.map { childFromSnapshot(it) }
+        )
+}

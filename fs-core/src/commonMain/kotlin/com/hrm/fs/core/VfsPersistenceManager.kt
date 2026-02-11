@@ -6,6 +6,7 @@ import com.hrm.fs.core.persistence.CorruptedDataException
 import com.hrm.fs.core.persistence.MountInfo
 import com.hrm.fs.core.persistence.PersistenceConfig
 import com.hrm.fs.core.persistence.SnapshotNode
+import com.hrm.fs.core.persistence.SnapshotTrashData
 import com.hrm.fs.core.persistence.SnapshotVersionData
 import com.hrm.fs.core.persistence.VfsPersistenceCodec
 import com.hrm.fs.core.persistence.WalEntry
@@ -54,6 +55,7 @@ internal class VfsPersistenceManager(
         val walEntries: List<WalEntry>,
         val mountInfos: List<MountInfo>,
         val versionData: SnapshotVersionData?,
+        val trashData: SnapshotTrashData?,
         /** 恢复过程中遇到的警告信息（数据损坏等），空列表表示完全正常。 */
         val recoveryWarnings: List<String> = emptyList()
     )
@@ -139,11 +141,23 @@ internal class VfsPersistenceManager(
             null
         }
 
+        // ── 读取 Trash（容错） ──
+        val trashData = try {
+            storage.read(config.trashKey).getOrNull()?.let {
+                VfsPersistenceCodec.decodeTrashData(it)
+            }
+        } catch (e: Exception) {
+            val msg = "Trash data corrupted, using empty trash: ${e.message}"
+            FLog.w(TAG, msg)
+            warnings.add(msg)
+            null
+        }
+
         if (warnings.isNotEmpty()) {
             FLog.w(TAG, "load completed with ${warnings.size} recovery warning(s)")
         }
-        FLog.i(TAG, "load completed: snapshot=${snapshot != null}, walEntries=${wal.size}, mounts=${mountInfos.size}, versions=${versionData?.entries?.size ?: 0}")
-        return LoadResult(snapshot, wal, mountInfos, versionData, warnings)
+        FLog.i(TAG, "load completed: snapshot=${snapshot != null}, walEntries=${wal.size}, mounts=${mountInfos.size}, versions=${versionData?.entries?.size ?: 0}, trash=${trashData?.entries?.size ?: 0}")
+        return LoadResult(snapshot, wal, mountInfos, versionData, trashData, warnings)
     }
 
     // ── WAL ──────────────────────────────────────────────────
@@ -160,7 +174,8 @@ internal class VfsPersistenceManager(
     suspend fun appendWal(
         entry: WalEntry,
         snapshotProvider: () -> SnapshotNode,
-        versionDataProvider: () -> SnapshotVersionData
+        versionDataProvider: () -> SnapshotVersionData,
+        trashDataProvider: () -> SnapshotTrashData
     ) {
         if (storage == null) return
         walEntries.add(entry)
@@ -169,7 +184,7 @@ internal class VfsPersistenceManager(
         FLog.v(TAG, "appendWal: opsSinceSnapshot=$opsSinceSnapshot, entry=$entry")
         if (opsSinceSnapshot >= config.autoSnapshotEvery) {
             FLog.d(TAG, "appendWal: auto snapshot triggered at $opsSinceSnapshot ops")
-            saveSnapshot(snapshotProvider(), versionDataProvider())
+            saveSnapshot(snapshotProvider(), versionDataProvider(), trashDataProvider())
         }
     }
 
@@ -180,7 +195,11 @@ internal class VfsPersistenceManager(
      * 如果在写 snapshot 之后、清 WAL 之前崩溃，
      * 下次恢复会 snapshot + WAL 重放（WAL 操作是幂等的，不会出错）。
      */
-    suspend fun saveSnapshot(snapshot: SnapshotNode, versionData: SnapshotVersionData? = null) {
+    suspend fun saveSnapshot(
+        snapshot: SnapshotNode,
+        versionData: SnapshotVersionData? = null,
+        trashData: SnapshotTrashData? = null
+    ) {
         if (storage == null) return
         FLog.d(TAG, "saveSnapshot: saving snapshot and clearing WAL")
         // Step 1: 写入 snapshot（带 CRC）
@@ -189,7 +208,11 @@ internal class VfsPersistenceManager(
         if (versionData != null) {
             storage.write(config.versionsKey, VfsPersistenceCodec.encodeVersionData(versionData))
         }
-        // Step 3: 清空 WAL（最后执行，保证崩溃安全）
+        // Step 3: 写入 trash（带 CRC）
+        if (trashData != null) {
+            storage.write(config.trashKey, VfsPersistenceCodec.encodeTrashData(trashData))
+        }
+        // Step 4: 清空 WAL（最后执行，保证崩溃安全）
         walEntries.clear()
         storage.write(config.walKey, VfsPersistenceCodec.encodeWal(walEntries))
         opsSinceSnapshot = 0
@@ -200,5 +223,12 @@ internal class VfsPersistenceManager(
     suspend fun persistMounts(mountInfos: List<MountInfo>) {
         if (storage == null) return
         storage.write(config.mountsKey, VfsPersistenceCodec.encodeMounts(mountInfos))
+    }
+
+    // ── 回收站持久化 ─────────────────────────────────────────
+
+    suspend fun persistTrash(trashData: SnapshotTrashData) {
+        if (storage == null) return
+        storage.write(config.trashKey, VfsPersistenceCodec.encodeTrashData(trashData))
     }
 }

@@ -12,6 +12,7 @@ internal data class PersistenceConfig(
     val walKey: String = "vfs_wal.json",
     val mountsKey: String = "vfs_mounts.json",
     val versionsKey: String = "vfs_versions.json",
+    val trashKey: String = "vfs_trash.json",
     val autoSnapshotEvery: Int = 20
 )
 
@@ -51,6 +52,12 @@ internal object VfsPersistenceCodec {
 
     fun decodeVersionData(bytes: ByteArray): SnapshotVersionData =
         json.decodeFromString(SnapshotVersionData.serializer(), unwrapCrc(bytes))
+
+    fun encodeTrashData(data: SnapshotTrashData): ByteArray =
+        wrapWithCrc(json.encodeToString(SnapshotTrashData.serializer(), data))
+
+    fun decodeTrashData(bytes: ByteArray): SnapshotTrashData =
+        json.decodeFromString(SnapshotTrashData.serializer(), unwrapCrc(bytes))
 
     /**
      * 将 JSON 字符串打包为 "CRC:<hex8>\n<json>" 格式的字节数组。
@@ -154,6 +161,36 @@ internal data class SnapshotVersionData(
     val entries: Map<String, List<SnapshotVersionEntry>> = emptyMap()
 )
 
+/**
+ * 回收站条目快照（可序列化）。
+ */
+@Serializable
+internal data class SnapshotTrashEntry(
+    val trashId: String,
+    val originalPath: String,
+    val type: String,
+    val deletedAtMillis: Long,
+    val content: ByteArray? = null,
+    val children: List<SnapshotTrashChild>? = null,
+    val isMounted: Boolean = false
+) {
+    @Serializable
+    data class SnapshotTrashChild(
+        val relativePath: String,
+        val type: String,
+        val content: ByteArray? = null,
+        val children: List<SnapshotTrashChild>? = null
+    )
+}
+
+/**
+ * 回收站快照数据包装。
+ */
+@Serializable
+internal data class SnapshotTrashData(
+    val entries: List<SnapshotTrashEntry> = emptyList()
+)
+
 @Serializable
 internal sealed class WalEntry {
     @Serializable
@@ -187,4 +224,12 @@ internal sealed class WalEntry {
     @Serializable
     @SerialName("RemoveXattr")
     data class RemoveXattr(val path: String, val name: String) : WalEntry()
+
+    @Serializable
+    @SerialName("MoveToTrash")
+    data class MoveToTrash(val path: String, val trashId: String) : WalEntry()
+
+    @Serializable
+    @SerialName("RestoreFromTrash")
+    data class RestoreFromTrash(val trashId: String, val path: String) : WalEntry()
 }

@@ -128,6 +128,80 @@ internal class FakeDiskFileOperations : DiskFileOperations {
         if (!exists(path)) return Result.failure(FsError.NotFound(path))
         return Result.success(xattrs[path]?.keys?.toList() ?: emptyList())
     }
+
+    // ── 回收站 ──────────────────────────────────────────────────
+
+    private val trashStore = mutableMapOf<String, TrashData>()
+    private var trashCounter = 0L
+
+    private data class TrashData(
+        val originalPath: String,
+        val type: FsType,
+        val content: ByteArray?,
+        val children: Map<String, ByteArray?>
+    )
+
+    override suspend fun moveToTrash(path: String): Result<String> {
+        if (!exists(path)) return Result.failure(FsError.NotFound(path))
+        val trashId = "disk_trash_${++trashCounter}"
+        val type = if (files.containsKey(path)) FsType.FILE else FsType.DIRECTORY
+        val content = files[path]
+        val childFiles = mutableMapOf<String, ByteArray?>()
+        if (type == FsType.DIRECTORY) {
+            val prefix = if (path == "/") "/" else "$path/"
+            files.keys.filter { it.startsWith(prefix) }.forEach { childFiles[it] = files[it] }
+            dirs.filter { it.startsWith(prefix) }.forEach { childFiles[it] = null }
+        }
+        trashStore[trashId] = TrashData(path, type, content, childFiles)
+        // 实际删除
+        if (type == FsType.FILE) {
+            files.remove(path)
+            createdFiles.remove(path)
+        } else {
+            childFiles.keys.forEach { files.remove(it); dirs.remove(it) }
+            dirs.remove(path)
+            createdDirs.remove(path)
+        }
+        return Result.success(trashId)
+    }
+
+    override suspend fun restoreFromTrash(trashId: String, originalRelativePath: String): Result<Unit> {
+        val data = trashStore[trashId] ?: return Result.failure(FsError.NotFound("trash: $trashId"))
+        if (data.type == FsType.FILE) {
+            files[originalRelativePath] = data.content ?: ByteArray(0)
+        } else {
+            dirs.add(originalRelativePath)
+            data.children.forEach { (k, v) ->
+                val newKey = k.replaceFirst(data.originalPath, originalRelativePath)
+                if (v != null) files[newKey] = v else dirs.add(newKey)
+            }
+        }
+        trashStore.remove(trashId)
+        return Result.success(Unit)
+    }
+
+    override suspend fun listTrash(): Result<List<TrashItem>> {
+        val items = trashStore.map { (id, data) ->
+            TrashItem(
+                trashId = id,
+                originalPath = data.originalPath,
+                type = data.type,
+                size = data.content?.size?.toLong() ?: 0L,
+                deletedAtMillis = 0L
+            )
+        }
+        return Result.success(items)
+    }
+
+    override suspend fun purgeTrash(trashId: String): Result<Unit> {
+        trashStore.remove(trashId) ?: return Result.failure(FsError.NotFound("trash: $trashId"))
+        return Result.success(Unit)
+    }
+
+    override suspend fun purgeAllTrash(): Result<Unit> {
+        trashStore.clear()
+        return Result.success(Unit)
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════

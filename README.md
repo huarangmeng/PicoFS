@@ -76,7 +76,7 @@
   - **✅ 文件扩展属性**（xattr / 自定义标签，set/get/remove/list，支持文件/目录/符号链接，WAL + Snapshot 持久化）
   - **✅ 压缩 / 解压**（ZIP/TAR 归档操作，compress/extract/list，支持自动格式检测，VFS 内存文件与挂载点统一操作，三端真实文件系统 JVM/Android/iOS 均支持）
   - **✅ 文件哈希 / 校验**（纯 Kotlin 实现 CRC32/SHA-256，`checksum()` API 支持内存文件与挂载点文件）
-  - **⬜ 回收站**（软删除 + 恢复机制）
+  - **✅ 回收站**（软删除 + 恢复机制，moveToTrash/restore/list/purge/purgeAll，支持文件/目录/符号链接，挂载点文件委托磁盘 `.trash` 目录管理，VFS 内存文件完整保存内容，自动修剪最旧条目，独立持久化）
   - **✅ 版本历史**（写入自动保存历史版本，`fileVersions()`/`readVersion()`/`restoreVersion()` API，支持内存文件与挂载点文件，独立持久化）
 
 ### 当前接口概览
@@ -116,10 +116,11 @@ interface FileSystem {
     val xattr: FsXattr           // set / get / remove / list
     val symlinks: FsSymlinks     // create / readLink
     val archive: FsArchive       // compress / extract / list（ZIP / TAR）
+    val trash: FsTrash           // moveToTrash / restore / list / purge / purgeAll
 }
 ```
 
-> 说明：该接口在 `commonMain` 中定义，基础 CRUD 直接在 `FileSystem` 上调用，扩展能力通过 9 个子接口属性访问（如 `fs.mounts.mount(...)`、`fs.archive.compress(...)`）。平台侧通过 `expect/actual` 提供沙箱路径与能力适配。
+> 说明：该接口在 `commonMain` 中定义，基础 CRUD 直接在 `FileSystem` 上调用，扩展能力通过 10 个子接口属性访问（如 `fs.mounts.mount(...)`、`fs.trash.moveToTrash(...)`）。平台侧通过 `expect/actual` 提供沙箱路径与能力适配。
 
 ### 平台实现思路（VFS）
 
