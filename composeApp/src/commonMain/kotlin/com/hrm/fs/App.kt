@@ -66,6 +66,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.hrm.fs.api.ArchiveEntry
 import com.hrm.fs.api.ArchiveFormat
 import com.hrm.fs.api.ChecksumAlgorithm
 import com.hrm.fs.api.DiskFileOperations
@@ -180,6 +181,7 @@ private fun FileExplorer(
     var checksumTarget by remember { mutableStateOf<FsEntry?>(null) }
     var editTarget by remember { mutableStateOf<FsEntry?>(null) }
     var archiveTarget by remember { mutableStateOf<FsEntry?>(null) }
+    var extractTarget by remember { mutableStateOf<FsEntry?>(null) }
     var showExtractDialog by remember { mutableStateOf(false) }
 
     fun fullPath(name: String) = if (currentPath == "/") "/$name" else "$currentPath/$name"
@@ -264,6 +266,7 @@ private fun FileExplorer(
                         onChecksum = { checksumTarget = entry },
                         onEdit = { editTarget = entry },
                         onArchive = { archiveTarget = entry },
+                        onExtract = { extractTarget = entry },
                         onTrash = {
                             scope.launch {
                                 fs.trash.moveToTrash(fullPath(entry.name)).fold(
@@ -337,9 +340,7 @@ private fun FileExplorer(
         InputDialog("解压归档", "归档文件路径 (如 /archive.zip)", onConfirm = { archivePath ->
             showExtractDialog = false
             scope.launch {
-                fs.archive.extract(archivePath, currentPath).fold(
-                    { refresh(); onMessage("已解压到 $currentPath") },
-                    { onMessage("解压失败: ${it.message}") })
+                doExtract(fs, archivePath, currentPath, scope, onMessage = { refresh(); onMessage(it) })
             }
         }, onDismiss = { showExtractDialog = false })
     }
@@ -430,6 +431,17 @@ private fun FileExplorer(
         ArchiveDialog(fs, fullPath(entry.name),
             onMessage = { msg -> refresh(); onMessage(msg) },
             onDismiss = { archiveTarget = null })
+    }
+
+    // 解压归档文件
+    extractTarget?.let { entry ->
+        val srcPath = fullPath(entry.name)
+        InputDialog("解压", "目标目录", initialValue = currentPath, onConfirm = { destDir ->
+            extractTarget = null
+            scope.launch {
+                doExtract(fs, srcPath, destDir, scope, onMessage = { refresh(); onMessage(it) })
+            }
+        }, onDismiss = { extractTarget = null })
     }
 }
 
@@ -1084,10 +1096,12 @@ private fun FileRow(
     onChecksum: () -> Unit,
     onEdit: () -> Unit,
     onArchive: () -> Unit,
+    onExtract: () -> Unit,
     onTrash: () -> Unit
 ) {
     val isDir = entry.type == FsType.DIRECTORY
     val isSymlink = entry.type == FsType.SYMLINK
+    val isArchive = !isDir && (entry.name.endsWith(".zip", true) || entry.name.endsWith(".tar", true))
     var showActions by remember { mutableStateOf(false) }
 
     Card(
@@ -1159,6 +1173,9 @@ private fun FileRow(
                     AssistChip(onClick = { showActions = false; onMove() }, label = { Text("移动", fontSize = 12.sp) })
                     AssistChip(onClick = { showActions = false; onRename() }, label = { Text("重命名", fontSize = 12.sp) })
                     AssistChip(onClick = { showActions = false; onArchive() }, label = { Text("打包", fontSize = 12.sp) })
+                    if (isArchive) {
+                        AssistChip(onClick = { showActions = false; onExtract() }, label = { Text("解压", fontSize = 12.sp) })
+                    }
                     AssistChip(onClick = { showActions = false; onTrash() }, label = { Text("回收站", fontSize = 12.sp) })
                     AssistChip(onClick = { showActions = false; onDelete() },
                         label = { Text("删除", fontSize = 12.sp, color = MaterialTheme.colorScheme.error) })
@@ -1262,4 +1279,33 @@ private fun ConfirmDialog(
             ) { Text(confirmLabel) }
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } })
+}
+
+/**
+ * 解压前检查同名文件冲突，有冲突则提示覆盖数量后执行解压。
+ */
+private suspend fun doExtract(
+    fs: FileSystem,
+    archivePath: String,
+    targetDir: String,
+    scope: kotlinx.coroutines.CoroutineScope,
+    onMessage: (String) -> Unit
+) {
+    val archiveEntries = fs.archive.list(archivePath).getOrElse {
+        onMessage("读取归档失败: ${it.message}")
+        return
+    }
+    val conflicts = mutableListOf<String>()
+    for (entry in archiveEntries) {
+        if (entry.type == FsType.DIRECTORY) continue
+        val destPath = if (targetDir == "/") "/${entry.path}" else "$targetDir/${entry.path}"
+        fs.stat(destPath).onSuccess { conflicts.add(entry.path) }
+    }
+    if (conflicts.isNotEmpty()) {
+        onMessage("⚠️ 将覆盖 ${conflicts.size} 个同名文件: ${conflicts.take(5).joinToString()}${if (conflicts.size > 5) " …等" else ""}，正在解压…")
+    }
+    fs.archive.extract(archivePath, targetDir).fold(
+        { onMessage("已解压到 $targetDir (共 ${archiveEntries.size} 条目${if (conflicts.isNotEmpty()) ", 覆盖 ${conflicts.size} 个" else ""})") },
+        { onMessage("解压失败: ${it.message}") }
+    )
 }
