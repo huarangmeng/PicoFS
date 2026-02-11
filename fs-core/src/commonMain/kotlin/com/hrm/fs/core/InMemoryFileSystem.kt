@@ -731,6 +731,62 @@ internal class InMemoryFileSystem(
     }
 
     // ═══════════════════════════════════════════════════════════
+    // 扩展属性（xattr）
+    // ═══════════════════════════════════════════════════════════
+
+    override suspend fun setXattr(path: String, name: String, value: ByteArray): Result<Unit> =
+        locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            val match = mountTable.findMount(normalized)
+            if (match != null) {
+                return@locked match.diskOps.setXattr(match.relativePath, name, value)
+            }
+            tree.setXattr(normalized, name, value).also { r ->
+                if (r.isSuccess) {
+                    walAppend(WalEntry.SetXattr(normalized, name, value))
+                }
+            }
+        }
+
+    override suspend fun getXattr(path: String, name: String): Result<ByteArray> =
+        locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            val match = mountTable.findMount(normalized)
+            if (match != null) {
+                return@locked match.diskOps.getXattr(match.relativePath, name)
+            }
+            tree.getXattr(normalized, name)
+        }
+
+    override suspend fun removeXattr(path: String, name: String): Result<Unit> =
+        locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            val match = mountTable.findMount(normalized)
+            if (match != null) {
+                return@locked match.diskOps.removeXattr(match.relativePath, name)
+            }
+            tree.removeXattr(normalized, name).also { r ->
+                if (r.isSuccess) {
+                    walAppend(WalEntry.RemoveXattr(normalized, name))
+                }
+            }
+        }
+
+    override suspend fun listXattrs(path: String): Result<List<String>> =
+        locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            val match = mountTable.findMount(normalized)
+            if (match != null) {
+                return@locked match.diskOps.listXattrs(match.relativePath)
+            }
+            tree.listXattrs(normalized)
+        }
+
+    // ═══════════════════════════════════════════════════════════
     // 符号链接
     // ═══════════════════════════════════════════════════════════
 

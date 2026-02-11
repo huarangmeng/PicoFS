@@ -73,7 +73,7 @@
   - **✅ 符号链接**（symlink，创建/读取/透明跟随/链式解析/相对路径/持久化）
   - **✅ 文件锁**（flock，文件级并发控制，共享锁/独占锁/锁升级/挂起等待）
   - **✅ 搜索 / 查找**（按文件名/内容搜索，类 find/grep，支持 glob 通配符、内容 grep、类型过滤、深度限制、大小写控制，跨内存与挂载点统一搜索）
-  - **⬜ 文件扩展属性**（xattr / 自定义标签）
+  - **✅ 文件扩展属性**（xattr / 自定义标签，set/get/remove/list，支持文件/目录/符号链接，WAL + Snapshot 持久化）
   - **⬜ 压缩 / 解压**（zip/tar 归档操作）
   - **✅ 文件哈希 / 校验**（纯 Kotlin 实现 CRC32/SHA-256，`checksum()` API 支持内存文件与挂载点文件）
   - **⬜ 回收站**（软删除 + 恢复机制）
@@ -142,6 +142,12 @@ interface FileSystem {
 
     // 搜索 / 查找
     suspend fun find(query: SearchQuery): Result<List<SearchResult>>
+
+    // 扩展属性（xattr）
+    suspend fun setXattr(path: String, name: String, value: ByteArray): Result<Unit>
+    suspend fun getXattr(path: String, name: String): Result<ByteArray>
+    suspend fun removeXattr(path: String, name: String): Result<Unit>
+    suspend fun listXattrs(path: String): Result<List<String>>
 }
 ```
 

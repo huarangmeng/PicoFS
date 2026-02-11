@@ -344,6 +344,46 @@ interface FileSystem {
      * @param versionId 要恢复到的版本 ID
      */
     suspend fun restoreVersion(path: String, versionId: String): Result<Unit>
+
+    // ─── 扩展属性（xattr） ──────────────────────────────────────
+
+    /**
+     * 设置文件或目录的扩展属性。
+     *
+     * 如果属性已存在则覆盖，不存在则创建。
+     * 仅支持内存文件树中的节点（挂载点不支持）。
+     *
+     * @param path 虚拟路径
+     * @param name 属性名（如 "user.tag", "color"）
+     * @param value 属性值（任意字节数据）
+     */
+    suspend fun setXattr(path: String, name: String, value: ByteArray): Result<Unit>
+
+    /**
+     * 获取文件或目录的扩展属性值。
+     *
+     * @param path 虚拟路径
+     * @param name 属性名
+     * @return 属性值，属性不存在时返回 [FsError.NotFound]
+     */
+    suspend fun getXattr(path: String, name: String): Result<ByteArray>
+
+    /**
+     * 删除文件或目录的扩展属性。
+     *
+     * @param path 虚拟路径
+     * @param name 属性名
+     * @return 属性不存在时返回 [FsError.NotFound]
+     */
+    suspend fun removeXattr(path: String, name: String): Result<Unit>
+
+    /**
+     * 列出文件或目录的所有扩展属性名。
+     *
+     * @param path 虚拟路径
+     * @return 属性名列表
+     */
+    suspend fun listXattrs(path: String): Result<List<String>>
 }
 
 /**
@@ -363,6 +403,36 @@ interface DiskFileOperations {
     suspend fun list(path: String): Result<List<FsEntry>>
     suspend fun stat(path: String): Result<FsMeta>
     suspend fun exists(path: String): Boolean
+
+    // ── 扩展属性（xattr） ──────────────────────────────────────
+
+    /**
+     * 设置文件或目录的扩展属性。
+     * 默认返回 [FsError.PermissionDenied]，平台实现可覆盖。
+     */
+    suspend fun setXattr(path: String, name: String, value: ByteArray): Result<Unit> =
+        Result.failure(FsError.PermissionDenied("xattr not supported"))
+
+    /**
+     * 获取文件或目录的扩展属性值。
+     * 默认返回 [FsError.PermissionDenied]，平台实现可覆盖。
+     */
+    suspend fun getXattr(path: String, name: String): Result<ByteArray> =
+        Result.failure(FsError.PermissionDenied("xattr not supported"))
+
+    /**
+     * 删除文件或目录的扩展属性。
+     * 默认返回 [FsError.PermissionDenied]，平台实现可覆盖。
+     */
+    suspend fun removeXattr(path: String, name: String): Result<Unit> =
+        Result.failure(FsError.PermissionDenied("xattr not supported"))
+
+    /**
+     * 列出文件或目录的所有扩展属性名。
+     * 默认返回 [FsError.PermissionDenied]，平台实现可覆盖。
+     */
+    suspend fun listXattrs(path: String): Result<List<String>> =
+        Result.failure(FsError.PermissionDenied("xattr not supported"))
 }
 
 /**

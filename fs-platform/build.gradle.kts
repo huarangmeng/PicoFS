@@ -17,6 +17,11 @@ kotlin {
         iosArm64(),
         iosSimulatorArm64()
     ).forEach { iosTarget ->
+        iosTarget.compilations.getByName("main") {
+            cinterops {
+                val xattr by creating
+            }
+        }
         iosTarget.binaries.framework {
             baseName = "fsPlatform"
             isStatic = true
@@ -36,6 +41,11 @@ kotlin {
             dependencies {
                 implementation(libs.kotlin.test)
                 implementation(libs.kotlinx.coroutines.test)
+            }
+        }
+        iosMain {
+            dependencies {
+
             }
         }
     }

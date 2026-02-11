@@ -392,6 +392,39 @@ internal class VfsTree {
         return Result.success(Unit)
     }
 
+    // ── 扩展属性（xattr） ──────────────────────────────────────
+
+    fun setXattr(normalized: String, name: String, value: ByteArray): Result<Unit> {
+        val node = resolveNodeOrError(normalized).getOrElse { return Result.failure(it) }
+        if (!node.permissions.canWrite()) return Result.failure(FsError.PermissionDenied(normalized))
+        node.xattrs[name] = value.copyOf()
+        node.modifiedAtMillis = nowMillis()
+        return Result.success(Unit)
+    }
+
+    fun getXattr(normalized: String, name: String): Result<ByteArray> {
+        val node = resolveNodeOrError(normalized).getOrElse { return Result.failure(it) }
+        if (!node.permissions.canRead()) return Result.failure(FsError.PermissionDenied(normalized))
+        val value = node.xattrs[name] ?: return Result.failure(FsError.NotFound("xattr '$name' on $normalized"))
+        return Result.success(value.copyOf())
+    }
+
+    fun removeXattr(normalized: String, name: String): Result<Unit> {
+        val node = resolveNodeOrError(normalized).getOrElse { return Result.failure(it) }
+        if (!node.permissions.canWrite()) return Result.failure(FsError.PermissionDenied(normalized))
+        if (node.xattrs.remove(name) == null) {
+            return Result.failure(FsError.NotFound("xattr '$name' on $normalized"))
+        }
+        node.modifiedAtMillis = nowMillis()
+        return Result.success(Unit)
+    }
+
+    fun listXattrs(normalized: String): Result<List<String>> {
+        val node = resolveNodeOrError(normalized).getOrElse { return Result.failure(it) }
+        if (!node.permissions.canRead()) return Result.failure(FsError.PermissionDenied(normalized))
+        return Result.success(node.xattrs.keys.toList())
+    }
+
     // ── 文件读写（内存） ──────────────────────────────────────
     fun readAt(node: FileNode, offset: Long, length: Int): Result<ByteArray> {
         if (!node.permissions.canRead()) return Result.failure(FsError.PermissionDenied(node.name))
@@ -537,6 +570,9 @@ internal class VfsTree {
                     entry.path,
                     entry.permissions.toFsPermissions()
                 )
+
+                is WalEntry.SetXattr -> setXattrInternal(entry.path, entry.name, entry.value)
+                is WalEntry.RemoveXattr -> removeXattrInternal(entry.path, entry.name)
             }
         }
     }
@@ -557,30 +593,41 @@ internal class VfsTree {
         return total
     }
 
-    private fun snapshotFromNode(node: VfsNode): SnapshotNode = when (node) {
-        is DirNode -> SnapshotNode(
-            name = node.name, type = node.type.name,
-            createdAtMillis = node.createdAtMillis, modifiedAtMillis = node.modifiedAtMillis,
-            permissions = SnapshotPermissions.from(node.permissions),
-            children = node.children.values.map { snapshotFromNode(it) }
-        )
+    private fun snapshotFromNode(node: VfsNode): SnapshotNode {
+        val xattrs = if (node.xattrs.isEmpty()) null
+        else node.xattrs.mapValues { it.value.copyOf() }
+        return when (node) {
+            is DirNode -> SnapshotNode(
+                name = node.name, type = node.type.name,
+                createdAtMillis = node.createdAtMillis, modifiedAtMillis = node.modifiedAtMillis,
+                permissions = SnapshotPermissions.from(node.permissions),
+                children = node.children.values.map { snapshotFromNode(it) },
+                xattrs = xattrs
+            )
 
-        is FileNode -> SnapshotNode(
-            name = node.name, type = node.type.name,
-            createdAtMillis = node.createdAtMillis, modifiedAtMillis = node.modifiedAtMillis,
-            permissions = SnapshotPermissions.from(node.permissions),
-            content = node.blocks.toByteArray()
-        )
+            is FileNode -> SnapshotNode(
+                name = node.name, type = node.type.name,
+                createdAtMillis = node.createdAtMillis, modifiedAtMillis = node.modifiedAtMillis,
+                permissions = SnapshotPermissions.from(node.permissions),
+                content = node.blocks.toByteArray(),
+                xattrs = xattrs
+            )
 
-        is SymlinkNode -> SnapshotNode(
-            name = node.name, type = node.type.name,
-            createdAtMillis = node.createdAtMillis, modifiedAtMillis = node.modifiedAtMillis,
-            permissions = SnapshotPermissions.from(node.permissions),
-            target = node.targetPath
-        )
+            is SymlinkNode -> SnapshotNode(
+                name = node.name, type = node.type.name,
+                createdAtMillis = node.createdAtMillis, modifiedAtMillis = node.modifiedAtMillis,
+                permissions = SnapshotPermissions.from(node.permissions),
+                target = node.targetPath,
+                xattrs = xattrs
+            )
+        }
     }
 
     private fun buildFromSnapshot(snapshot: SnapshotNode): DirNode {
+        fun restoreXattrs(vfsNode: VfsNode, snapshotNode: SnapshotNode) {
+            snapshotNode.xattrs?.forEach { (k, v) -> vfsNode.xattrs[k] = v }
+        }
+
         fun build(node: SnapshotNode): VfsNode {
             val perms = node.permissions.toFsPermissions()
             return when (node.fsType()) {
@@ -590,13 +637,16 @@ internal class VfsTree {
                         val childNode = build(child)
                         dir.children[childNode.name] = childNode
                     }
+                    restoreXattrs(dir, node)
                     dir
                 }
                 FsType.SYMLINK -> {
-                    SymlinkNode(
+                    val sym = SymlinkNode(
                         node.name, node.createdAtMillis, node.modifiedAtMillis, perms,
                         node.target ?: ""
                     )
+                    restoreXattrs(sym, node)
+                    sym
                 }
                 FsType.FILE -> {
                     val file = FileNode(node.name, node.createdAtMillis, node.modifiedAtMillis, perms)
@@ -604,6 +654,7 @@ internal class VfsTree {
                     if (content.isNotEmpty()) {
                         file.blocks.write(0, content)
                     }
+                    restoreXattrs(file, node)
                     file
                 }
             }
@@ -677,6 +728,20 @@ internal class VfsTree {
         val normalized = PathUtils.normalize(path)
         val node = resolveNode(normalized) ?: return
         node.permissions = permissions
+        node.modifiedAtMillis = nowMillis()
+    }
+
+    private fun setXattrInternal(path: String, name: String, value: ByteArray) {
+        val normalized = PathUtils.normalize(path)
+        val node = resolveNode(normalized) ?: return
+        node.xattrs[name] = value.copyOf()
+        node.modifiedAtMillis = nowMillis()
+    }
+
+    private fun removeXattrInternal(path: String, name: String) {
+        val normalized = PathUtils.normalize(path)
+        val node = resolveNode(normalized) ?: return
+        node.xattrs.remove(name)
         node.modifiedAtMillis = nowMillis()
     }
 }

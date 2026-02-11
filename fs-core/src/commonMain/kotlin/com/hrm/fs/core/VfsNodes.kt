@@ -10,7 +10,10 @@ internal sealed class VfsNode(
     val createdAtMillis: Long,
     var modifiedAtMillis: Long,
     var permissions: FsPermissions
-)
+) {
+    /** 扩展属性（xattr）：name -> value。所有节点类型都可以有扩展属性。 */
+    val xattrs: MutableMap<String, ByteArray> = LinkedHashMap()
+}
 
 internal class DirNode(
     name: String,

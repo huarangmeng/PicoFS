@@ -147,6 +147,62 @@ internal class IosDiskFileOperations(override val rootPath: String) : DiskFileOp
         return fm.fileExistsAtPath(resolve(path))
     }
 
+    // ═══════════════════════════════════════════════════════════
+    // xattr — 基于 cinterop 绑定 <sys/xattr.h>
+    // ═══════════════════════════════════════════════════════════
+
+    @OptIn(ExperimentalForeignApi::class)
+    override suspend fun setXattr(path: String, name: String, value: ByteArray): Result<Unit> = runCatching {
+        val full = resolve(path)
+        if (!fm.fileExistsAtPath(full)) throw FsError.NotFound(path)
+        val result = if (value.isEmpty()) {
+            xattr.setxattr(full, name, null, 0u, 0u, 0)
+        } else {
+            value.usePinned { pinned ->
+                xattr.setxattr(full, name, pinned.addressOf(0), value.size.toULong(), 0u, 0)
+            }
+        }
+        if (result != 0) throw FsError.PermissionDenied("setxattr failed for '$name' on $path (errno=${platform.posix.errno})")
+    }
+
+    @OptIn(ExperimentalForeignApi::class)
+    override suspend fun getXattr(path: String, name: String): Result<ByteArray> = runCatching {
+        val full = resolve(path)
+        if (!fm.fileExistsAtPath(full)) throw FsError.NotFound(path)
+        val size = xattr.getxattr(full, name, null, 0u, 0u, 0)
+        if (size < 0) throw FsError.NotFound("xattr '$name' on $path")
+        if (size == 0L) return@runCatching ByteArray(0)
+        val bytes = ByteArray(size.toInt())
+        val read = bytes.usePinned { pinned ->
+            xattr.getxattr(full, name, pinned.addressOf(0), size.toULong(), 0u, 0)
+        }
+        if (read < 0) throw FsError.NotFound("xattr '$name' on $path")
+        bytes
+    }
+
+    @OptIn(ExperimentalForeignApi::class)
+    override suspend fun removeXattr(path: String, name: String): Result<Unit> = runCatching {
+        val full = resolve(path)
+        if (!fm.fileExistsAtPath(full)) throw FsError.NotFound(path)
+        val result = xattr.removexattr(full, name, 0)
+        if (result != 0) throw FsError.NotFound("xattr '$name' on $path")
+    }
+
+    @OptIn(ExperimentalForeignApi::class)
+    override suspend fun listXattrs(path: String): Result<List<String>> = runCatching {
+        val full = resolve(path)
+        if (!fm.fileExistsAtPath(full)) throw FsError.NotFound(path)
+        val bufSize = xattr.listxattr(full, null, 0u, 0)
+        if (bufSize < 0) throw FsError.PermissionDenied("listxattr failed on $path")
+        if (bufSize == 0L) return@runCatching emptyList()
+        val buf = ByteArray(bufSize.toInt())
+        val read = buf.usePinned { pinned ->
+            xattr.listxattr(full, pinned.addressOf(0), bufSize.toULong(), 0)
+        }
+        if (read < 0) throw FsError.PermissionDenied("listxattr failed on $path")
+        buf.decodeToString().split('\u0000').filter { it.isNotEmpty() }
+    }
+
     @OptIn(ExperimentalForeignApi::class)
     private fun isDirectory(fullPath: String): Boolean {
         val attrs = fm.attributesOfItemAtPath(fullPath, error = null) ?: return false

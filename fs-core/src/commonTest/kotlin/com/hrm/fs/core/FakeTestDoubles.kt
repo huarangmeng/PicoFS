@@ -26,6 +26,7 @@ internal class FakeDiskFileOperations : DiskFileOperations {
     val createdDirs = mutableSetOf<String>()
     val files = mutableMapOf<String, ByteArray>()
     val dirs = mutableSetOf<String>("/")
+    val xattrs = mutableMapOf<String, MutableMap<String, ByteArray>>()
 
     override suspend fun createFile(path: String): Result<Unit> {
         createdFiles.add(path)
@@ -104,6 +105,29 @@ internal class FakeDiskFileOperations : DiskFileOperations {
     }
 
     override suspend fun exists(path: String): Boolean = files.containsKey(path) || dirs.contains(path)
+
+    override suspend fun setXattr(path: String, name: String, value: ByteArray): Result<Unit> {
+        if (!exists(path)) return Result.failure(FsError.NotFound(path))
+        xattrs.getOrPut(path) { mutableMapOf() }[name] = value.copyOf()
+        return Result.success(Unit)
+    }
+
+    override suspend fun getXattr(path: String, name: String): Result<ByteArray> {
+        if (!exists(path)) return Result.failure(FsError.NotFound(path))
+        val v = xattrs[path]?.get(name) ?: return Result.failure(FsError.NotFound("xattr '$name' on $path"))
+        return Result.success(v.copyOf())
+    }
+
+    override suspend fun removeXattr(path: String, name: String): Result<Unit> {
+        if (!exists(path)) return Result.failure(FsError.NotFound(path))
+        if (xattrs[path]?.remove(name) == null) return Result.failure(FsError.NotFound("xattr '$name' on $path"))
+        return Result.success(Unit)
+    }
+
+    override suspend fun listXattrs(path: String): Result<List<String>> {
+        if (!exists(path)) return Result.failure(FsError.NotFound(path))
+        return Result.success(xattrs[path]?.keys?.toList() ?: emptyList())
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════

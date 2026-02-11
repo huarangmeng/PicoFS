@@ -128,7 +128,9 @@ internal data class SnapshotNode(
     val children: List<SnapshotNode>? = null,
     val versions: List<SnapshotVersionEntry>? = null,
     /** 符号链接目标路径，仅 type == "SYMLINK" 时有值。 */
-    val target: String? = null
+    val target: String? = null,
+    /** 扩展属性（xattr），为空时不序列化。 */
+    val xattrs: Map<String, ByteArray>? = null
 ) {
     fun fsType(): FsType = when (type) {
         "DIRECTORY" -> FsType.DIRECTORY
@@ -177,4 +179,12 @@ internal sealed class WalEntry {
     @Serializable
     @SerialName("SetPermissions")
     data class SetPermissions(val path: String, val permissions: SnapshotPermissions) : WalEntry()
+
+    @Serializable
+    @SerialName("SetXattr")
+    data class SetXattr(val path: String, val name: String, val value: ByteArray) : WalEntry()
+
+    @Serializable
+    @SerialName("RemoveXattr")
+    data class RemoveXattr(val path: String, val name: String) : WalEntry()
 }
