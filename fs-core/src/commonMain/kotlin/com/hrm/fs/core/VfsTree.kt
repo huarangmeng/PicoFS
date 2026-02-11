@@ -38,7 +38,55 @@ internal class VfsTree {
     var root: DirNode = DirNode("/", nowMillis(), nowMillis(), FsPermissions.FULL)
         private set
 
+    /** 增量维护的已用字节数缓存，避免每次都遍历整棵树。 */
+    private var _usedBytes: Long = 0L
+
     // ── 节点解析 ────────────────────────────────────────────────
+
+    /**
+     * 内联路径段迭代器，避免 split("/") 分配列表。
+     * 对 [path] 中每个路径段调用 [action](segment, isLast)。
+     */
+    private inline fun forEachSegment(path: String, action: (segment: String, index: Int, isLast: Boolean) -> Unit) {
+        val str = if (path.startsWith("/")) path else "/$path"
+        var start = 1 // 跳过开头的 '/'
+        var segIndex = 0
+        while (start < str.length) {
+            val end = str.indexOf('/', start)
+            if (end < 0) {
+                // 最后一段
+                val seg = str.substring(start)
+                if (seg.isNotEmpty()) action(seg, segIndex, true)
+                return
+            }
+            val seg = str.substring(start, end)
+            if (seg.isNotEmpty()) {
+                // 预判是否为最后一段：看后面是否还有非空内容
+                val remaining = str.substring(end + 1)
+                val isLast = remaining.isBlank() || remaining.all { it == '/' }
+                action(seg, segIndex, isLast)
+                segIndex++
+            }
+            start = end + 1
+        }
+    }
+
+    /** 计算路径段数（不分配列表）。 */
+    private fun segmentCount(path: String): Int {
+        val str = if (path.startsWith("/")) path else "/$path"
+        var count = 0
+        var start = 1
+        while (start < str.length) {
+            val end = str.indexOf('/', start)
+            if (end < 0) {
+                if (start < str.length) count++
+                break
+            }
+            if (end > start) count++
+            start = end + 1
+        }
+        return count
+    }
 
     /**
      * 解析路径到节点，默认跟随符号链接。
@@ -57,23 +105,24 @@ internal class VfsTree {
     private fun resolveNodeInternal(path: String, followSymlinks: Boolean, depth: Int): VfsNode? {
         if (depth > MAX_SYMLINK_DEPTH) return null
         if (path == "/") return root
-        val parts = path.removePrefix("/").split("/").filter { it.isNotBlank() }
+        val totalSegments = segmentCount(path)
         var current: VfsNode = root
         var currentPath = ""
-        for ((index, part) in parts.withIndex()) {
+        forEachSegment(path) { part, index, _ ->
             // 如果当前节点是 symlink 且需要跟随，先解析 symlink
-            if (current is SymlinkNode && followSymlinks) {
-                val resolved = resolveSymlinkTarget(current, currentPath, depth + 1) ?: return null
+            val cur = current
+            if (cur is SymlinkNode && followSymlinks) {
+                val resolved = resolveSymlinkTarget(cur, currentPath, depth + 1) ?: return null
                 current = resolved
             }
-            if (current !is DirNode) return null
-            val child = current.children[part] ?: return null
+            val dir = current as? DirNode ?: return null
+            val child = dir.children[part] ?: return null
             currentPath = if (currentPath.isEmpty()) "/$part" else "$currentPath/$part"
             // 对于中间路径段的 symlink，总是跟随
-            if (child is SymlinkNode && followSymlinks && index < parts.size - 1) {
+            if (child is SymlinkNode && followSymlinks && index < totalSegments - 1) {
                 val resolved = resolveSymlinkTarget(child, currentPath, depth + 1) ?: return null
                 current = resolved
-            } else if (child is SymlinkNode && followSymlinks && index == parts.size - 1) {
+            } else if (child is SymlinkNode && followSymlinks && index == totalSegments - 1) {
                 // 最后一段也跟随
                 val resolved = resolveSymlinkTarget(child, currentPath, depth + 1) ?: return null
                 current = resolved
@@ -115,6 +164,8 @@ internal class VfsTree {
     private fun resolvePathInternal(path: String, depth: Int): String? {
         if (depth > MAX_SYMLINK_DEPTH) return null
         if (path == "/") return "/"
+        // resolvePathInternal 需要 parts.drop() 拼接剩余路径，仍使用 split，
+        // 但此方法不在热路径上（仅 stat 的 symlink 分支调用），影响可忽略。
         val parts = path.removePrefix("/").split("/").filter { it.isNotBlank() }
         var current: VfsNode = root
         var currentPath = ""
@@ -172,18 +223,19 @@ internal class VfsTree {
      */
     fun resolveNodeNoFollow(path: String): VfsNode? {
         if (path == "/") return root
-        val parts = path.removePrefix("/").split("/").filter { it.isNotBlank() }
+        val totalSegments = segmentCount(path)
         var current: VfsNode = root
         var currentPath = ""
-        for ((index, part) in parts.withIndex()) {
-            if (current is SymlinkNode) {
-                val resolved = resolveSymlinkTarget(current, currentPath, 1) ?: return null
+        forEachSegment(path) { part, index, _ ->
+            val cur = current
+            if (cur is SymlinkNode) {
+                val resolved = resolveSymlinkTarget(cur, currentPath, 1) ?: return null
                 current = resolved
             }
-            if (current !is DirNode) return null
-            val child = current.children[part] ?: return null
+            val dir = current as? DirNode ?: return null
+            val child = dir.children[part] ?: return null
             currentPath = if (currentPath.isEmpty()) "/$part" else "$currentPath/$part"
-            if (index < parts.size - 1 && child is SymlinkNode) {
+            if (index < totalSegments - 1 && child is SymlinkNode) {
                 // 中间路径段：跟随 symlink
                 val resolved = resolveSymlinkTarget(child, currentPath, 1) ?: return null
                 current = resolved
@@ -279,6 +331,9 @@ internal class VfsTree {
                 normalized
             )
         )
+        if (node is FileNode) {
+            _usedBytes -= node.size.toLong()
+        }
         parentNode.children.remove(name)
         parentNode.modifiedAtMillis = nowMillis()
         return Result.success(Unit)
@@ -348,25 +403,77 @@ internal class VfsTree {
     fun writeAt(node: FileNode, offset: Long, data: ByteArray): Result<Unit> {
         if (!node.permissions.canWrite()) return Result.failure(FsError.PermissionDenied(node.name))
         if (offset < 0) return Result.failure(FsError.InvalidPath("offset"))
+        val oldSize = node.size.toLong()
         node.blocks.write(offset.toInt(), data)
+        _usedBytes += node.size.toLong() - oldSize
         node.modifiedAtMillis = nowMillis()
         return Result.success(Unit)
     }
 
     // ── 空间统计 ──────────────────────────────────────────────
 
-    /** 计算内存文件树中所有文件的有效字节数总和。 */
-    fun totalUsedBytes(): Long {
-        var total = 0L
-        fun walk(node: VfsNode) {
-            when (node) {
-                is FileNode -> total += node.size
-                is DirNode -> node.children.values.forEach { walk(it) }
-                is SymlinkNode -> { /* symlink 不占用文件内容空间 */ }
+    /** 返回增量维护的已用字节数（O(1)）。 */
+    fun totalUsedBytes(): Long = _usedBytes
+
+    // ── 搜索 / 查找（内存树部分） ────────────────────────────
+
+    /**
+     * 在内存文件树中搜索匹配条件的节点。
+     *
+     * DFS 遍历，对每个节点调用 [matcher] 判断是否匹配。
+     * 不进入挂载点目录（挂载点由外部另行处理）。
+     *
+     * @param rootPath 搜索起始路径
+     * @param maxDepth 最大递归深度（-1 无限制）
+     * @param mountPoints 活跃挂载点集合，遍历时跳过挂载点子树
+     * @param matcher 匹配回调：(path, node) -> 是否匹配
+     * @return 匹配的 (path, node) 列表
+     */
+    fun find(
+        rootPath: String,
+        maxDepth: Int,
+        mountPoints: Set<String>,
+        matcher: (String, VfsNode) -> Boolean
+    ): List<Pair<String, VfsNode>> {
+        val startNode = resolveNode(rootPath) ?: return emptyList()
+        val results = mutableListOf<Pair<String, VfsNode>>()
+
+        fun walk(node: VfsNode, path: String, depth: Int) {
+            // 跳过挂载点子树（由外部处理）
+            if (path != rootPath && mountPoints.contains(path)) return
+
+            if (matcher(path, node)) {
+                results.add(path to node)
+            }
+
+            if (node is DirNode && (maxDepth < 0 || depth < maxDepth)) {
+                for ((childName, child) in node.children) {
+                    val childPath = if (path == "/") "/$childName" else "$path/$childName"
+                    walk(child, childPath, depth + 1)
+                }
             }
         }
-        walk(root)
-        return total
+
+        // 根节点本身不算深度，从 depth=0 开始
+        if (startNode is DirNode) {
+            // 对于目录，先检查根本身，再遍历子节点
+            if (matcher(rootPath, startNode)) {
+                results.add(rootPath to startNode)
+            }
+            if (maxDepth != 0) {
+                for ((childName, child) in startNode.children) {
+                    val childPath = if (rootPath == "/") "/$childName" else "$rootPath/$childName"
+                    walk(child, childPath, 1)
+                }
+            }
+        } else {
+            // 搜索单个文件/symlink
+            if (matcher(rootPath, startNode)) {
+                results.add(rootPath to startNode)
+            }
+        }
+
+        return results
     }
 
     // ── 确保挂载点目录存在 ────────────────────────────────────
@@ -412,6 +519,7 @@ internal class VfsTree {
     fun restoreFromSnapshot(snapshot: SnapshotNode) {
         FLog.d(TAG, "restoreFromSnapshot: root=${snapshot.name}")
         root = buildFromSnapshot(snapshot)
+        _usedBytes = recalcUsedBytes()
     }
 
     // ── WAL 回放（静默，不抛异常） ───────────────────────────
@@ -434,6 +542,20 @@ internal class VfsTree {
     }
 
     // ── internal helpers ─────────────────────────────────────
+
+    /** 遍历整棵树计算已用字节数，仅在快照恢复时调用。 */
+    private fun recalcUsedBytes(): Long {
+        var total = 0L
+        fun walk(node: VfsNode) {
+            when (node) {
+                is FileNode -> total += node.size
+                is DirNode -> node.children.values.forEach { walk(it) }
+                is SymlinkNode -> {}
+            }
+        }
+        walk(root)
+        return total
+    }
 
     private fun snapshotFromNode(node: VfsNode): SnapshotNode = when (node) {
         is DirNode -> SnapshotNode(
@@ -534,6 +656,9 @@ internal class VfsTree {
         val parentNode = resolveNode(parent) as? DirNode ?: return
         val node = parentNode.children[name] ?: return
         if (node is DirNode && node.children.isNotEmpty()) return
+        if (node is FileNode) {
+            _usedBytes -= node.size.toLong()
+        }
         parentNode.children.remove(name)
         parentNode.modifiedAtMillis = nowMillis()
     }
@@ -542,7 +667,9 @@ internal class VfsTree {
         val normalized = PathUtils.normalize(path)
         val node = resolveNode(normalized)
         if (node !is FileNode) return
+        val oldSize = node.size.toLong()
         node.blocks.write(offset.toInt(), data)
+        _usedBytes += node.size.toLong() - oldSize
         node.modifiedAtMillis = nowMillis()
     }
 

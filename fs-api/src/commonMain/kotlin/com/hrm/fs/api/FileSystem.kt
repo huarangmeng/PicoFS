@@ -300,6 +300,19 @@ interface FileSystem {
         algorithm: ChecksumAlgorithm = ChecksumAlgorithm.SHA256
     ): Result<String>
 
+    // ─── 搜索 / 查找 ─────────────────────────────────────────────
+
+    /**
+     * 在指定目录下递归搜索文件和目录。
+     *
+     * 支持按文件名模式匹配（类 `find`）和按文件内容匹配（类 `grep`）。
+     * 同时支持内存文件树和挂载点下的文件搜索。
+     *
+     * @param query 搜索查询条件
+     * @return 匹配的搜索结果列表
+     */
+    suspend fun find(query: SearchQuery): Result<List<SearchResult>>
+
     // ─── 版本历史 ───────────────────────────────────────────────
 
     /**
@@ -489,6 +502,53 @@ data class FileVersion(
     val versionId: String,
     val timestampMillis: Long,
     val size: Long
+)
+
+// ─── 搜索查询与结果 ──────────────────────────────────────────
+
+/**
+ * 搜索查询条件。
+ *
+ * @param rootPath 搜索的根目录（默认 "/"）
+ * @param namePattern 文件名匹配模式（支持 `*` 和 `?` 通配符，如 `*.txt`、`doc?.md`）。为 null 时不过滤文件名。
+ * @param contentPattern 文件内容匹配（普通子串匹配）。为 null 时不过滤内容。仅对文件生效。
+ * @param typeFilter 只搜索指定类型。为 null 时搜索所有类型。
+ * @param maxDepth 最大递归深度（-1 表示无限制，0 表示只搜索 rootPath 本身，1 表示只搜索直接子项）。
+ * @param caseSensitive 文件名和内容匹配是否区分大小写（默认 false）。
+ */
+data class SearchQuery(
+    val rootPath: String = "/",
+    val namePattern: String? = null,
+    val contentPattern: String? = null,
+    val typeFilter: FsType? = null,
+    val maxDepth: Int = -1,
+    val caseSensitive: Boolean = false
+)
+
+/**
+ * 搜索结果条目。
+ *
+ * @param path 匹配项的虚拟路径
+ * @param type 文件类型
+ * @param size 文件大小（目录为 0）
+ * @param matchedLines 当按内容搜索时，匹配的行列表（行号从 1 开始）。文件名搜索时为空列表。
+ */
+data class SearchResult(
+    val path: String,
+    val type: FsType,
+    val size: Long = 0,
+    val matchedLines: List<MatchedLine> = emptyList()
+)
+
+/**
+ * 内容搜索匹配到的行。
+ *
+ * @param lineNumber 行号（从 1 开始）
+ * @param content 该行的完整内容
+ */
+data class MatchedLine(
+    val lineNumber: Int,
+    val content: String
 )
 
 interface FsStorage {

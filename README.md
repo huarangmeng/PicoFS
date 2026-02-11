@@ -72,7 +72,7 @@
 - **高级功能**
   - **✅ 符号链接**（symlink，创建/读取/透明跟随/链式解析/相对路径/持久化）
   - **✅ 文件锁**（flock，文件级并发控制，共享锁/独占锁/锁升级/挂起等待）
-  - **⬜ 搜索 / 查找**（按文件名/内容搜索，类 find/grep）
+  - **✅ 搜索 / 查找**（按文件名/内容搜索，类 find/grep，支持 glob 通配符、内容 grep、类型过滤、深度限制、大小写控制，跨内存与挂载点统一搜索）
   - **⬜ 文件扩展属性**（xattr / 自定义标签）
   - **⬜ 压缩 / 解压**（zip/tar 归档操作）
   - **✅ 文件哈希 / 校验**（纯 Kotlin 实现 CRC32/SHA-256，`checksum()` API 支持内存文件与挂载点文件）
@@ -139,6 +139,9 @@ interface FileSystem {
     suspend fun fileVersions(path: String): Result<List<FileVersion>>
     suspend fun readVersion(path: String, versionId: String): Result<ByteArray>
     suspend fun restoreVersion(path: String, versionId: String): Result<Unit>
+
+    // 搜索 / 查找
+    suspend fun find(query: SearchQuery): Result<List<SearchResult>>
 }
 ```
 

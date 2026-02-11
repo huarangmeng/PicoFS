@@ -57,7 +57,7 @@ internal class InMemoryFileHandle(
             FLog.w(TAG, "writeAt failed: permission denied for $virtualPath, mode=$mode")
             return Result.failure(FsError.PermissionDenied("write"))
         }
-        return fs.writeAt(node, offset, data)
+        return fs.writeAt(node, offset, data, virtualPath)
     }
 
     override suspend fun lock(type: FileLockType): Result<Unit> {

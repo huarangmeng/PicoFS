@@ -24,6 +24,17 @@ internal class MountTable {
     private val active: MutableMap<String, Pair<DiskFileOperations, MountOptions>> = LinkedHashMap()
 
     /**
+     * 预排序的挂载点列表（按路径长度降序），仅在 mount/unmount 时重建。
+     * 避免每次 [findMount] 都排序。
+     */
+    private var sortedMounts: List<Map.Entry<String, Pair<DiskFileOperations, MountOptions>>> = emptyList()
+
+    /** 重建预排序缓存。仅在 mount/unmount 时调用。 */
+    private fun rebuildSortedMounts() {
+        sortedMounts = active.entries.sortedByDescending { it.key.length }
+    }
+
+    /**
      * 持久化恢复出来、但尚未被外部 [mount] 重新挂载的条目。
      * key = virtualPath, value = 完整的 MountInfo（含 rootPath / readOnly）。
      * 外部可通过 [pendingMounts] 拿到列表，再调用 [mount] 使其生效。
@@ -39,6 +50,7 @@ internal class MountTable {
         }
         active[normalizedPath] = diskOps to options
         pending.remove(normalizedPath)
+        rebuildSortedMounts()
         FLog.d(TAG, "mount: $normalizedPath -> ${diskOps.rootPath}")
         return Result.success(Unit)
     }
@@ -48,6 +60,7 @@ internal class MountTable {
             FLog.w(TAG, "unmount failed: not mounted $normalizedPath")
             return Result.failure(FsError.NotMounted(normalizedPath))
         }
+        rebuildSortedMounts()
         FLog.d(TAG, "unmount: $normalizedPath")
         return Result.success(Unit)
     }
@@ -70,8 +83,9 @@ internal class MountTable {
      * 返回 null 表示该路径不在任何挂载点下。
      */
     fun findMount(normalizedPath: String): MountMatch? {
-        for ((mountPoint, pair) in active.entries.sortedByDescending { it.key.length }) {
-            val (diskOps, options) = pair
+        for (entry in sortedMounts) {
+            val mountPoint = entry.key
+            val (diskOps, options) = entry.value
             if (normalizedPath == mountPoint) {
                 return MountMatch(mountPoint, diskOps, "/", options)
             }

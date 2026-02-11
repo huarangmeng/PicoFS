@@ -15,11 +15,14 @@ import com.hrm.fs.api.FsMetrics
 import com.hrm.fs.api.FsPermissions
 import com.hrm.fs.api.FsStorage
 import com.hrm.fs.api.FsType
+import com.hrm.fs.api.MatchedLine
 import com.hrm.fs.api.MountOptions
 import com.hrm.fs.api.OpenMode
 import com.hrm.fs.api.PathUtils
 import com.hrm.fs.api.PendingMount
 import com.hrm.fs.api.QuotaInfo
+import com.hrm.fs.api.SearchQuery
+import com.hrm.fs.api.SearchResult
 import com.hrm.fs.api.log.FLog
 import com.hrm.fs.core.VfsMetricsCollector.Op
 import com.hrm.fs.core.persistence.PersistenceConfig
@@ -125,6 +128,203 @@ internal class InMemoryFileSystem(
         if (node !is FileNode) return Result.failure(FsError.NotFile(normalized))
         if (!node.permissions.canRead()) return Result.failure(FsError.PermissionDenied(normalized))
         return Result.success(node.blocks.toByteArray())
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 搜索 / 查找
+    // ═══════════════════════════════════════════════════════════
+
+    override suspend fun find(query: SearchQuery): Result<List<SearchResult>> = locked {
+        ensureLoaded()
+        val rootPath = PathUtils.normalize(query.rootPath)
+        FLog.d(TAG, "find: rootPath=$rootPath, namePattern=${query.namePattern}, contentPattern=${query.contentPattern}")
+
+        val results = mutableListOf<SearchResult>()
+        val activeMountPoints = mountTable.listMounts().toSet()
+
+        // ── 1. 搜索内存树 ──────────────────────────────────────
+
+        val nameMatcher = query.namePattern?.let { buildGlobMatcher(it, query.caseSensitive) }
+        val contentNeedle = query.contentPattern?.let {
+            if (query.caseSensitive) it else it.lowercase()
+        }
+
+        val memoryMatches = tree.find(rootPath, query.maxDepth, activeMountPoints) { path, node ->
+            // 类型过滤
+            if (query.typeFilter != null && node.type != query.typeFilter) return@find false
+            // 文件名匹配
+            if (nameMatcher != null) {
+                val name = path.substringAfterLast('/')
+                if (!nameMatcher(name)) return@find false
+            }
+            // 内容搜索在后续处理（此处先做名称匹配收集候选）
+            if (contentNeedle != null && node !is FileNode) return@find false
+            true
+        }
+
+        for ((path, node) in memoryMatches) {
+            if (contentNeedle != null && node is FileNode) {
+                // 读取文件内容做 grep
+                if (!node.permissions.canRead()) continue
+                val data = node.blocks.toByteArray()
+                val matchedLines = grepContent(data, contentNeedle, query.caseSensitive)
+                if (matchedLines.isEmpty()) continue
+                results.add(SearchResult(path, node.type, node.size.toLong(), matchedLines))
+            } else {
+                val size = if (node is FileNode) node.size.toLong() else 0L
+                results.add(SearchResult(path, node.type, size))
+            }
+        }
+
+        // ── 2. 搜索挂载点 ──────────────────────────────────────
+
+        for (mountPoint in activeMountPoints) {
+            // 只搜索 rootPath 子树中的挂载点
+            if (!mountPoint.startsWith(rootPath) && rootPath != "/") continue
+            if (rootPath != "/" && !rootPath.startsWith(mountPoint) && !mountPoint.startsWith(rootPath)) continue
+
+            val match = mountTable.findMount(mountPoint) ?: continue
+            val diskOps = match.diskOps
+
+            // 计算在挂载点内的搜索起始相对路径
+            val diskSearchRoot = if (rootPath.startsWith("$mountPoint/")) {
+                rootPath.removePrefix(mountPoint)
+            } else {
+                "/"
+            }
+
+            // 挂载点搜索的深度调整
+            val depthOffset = if (rootPath == "/" || mountPoint.startsWith("$rootPath/")) {
+                // 挂载点在搜索根路径下：已消耗的深度
+                mountPoint.removePrefix(rootPath).count { it == '/' }
+            } else {
+                0
+            }
+            val adjustedMaxDepth = if (query.maxDepth < 0) -1
+            else maxOf(0, query.maxDepth - depthOffset)
+
+            if (query.maxDepth >= 0 && adjustedMaxDepth <= 0 && diskSearchRoot == "/") continue
+
+            searchMountPoint(
+                mountPoint, diskOps, diskSearchRoot, adjustedMaxDepth,
+                nameMatcher, contentNeedle, query.typeFilter, query.caseSensitive,
+                results
+            )
+        }
+
+        FLog.d(TAG, "find completed: ${results.size} results")
+        Result.success(results.toList())
+    }
+
+    /**
+     * 递归搜索挂载点下的文件。
+     */
+    private suspend fun searchMountPoint(
+        mountPoint: String,
+        diskOps: DiskFileOperations,
+        diskPath: String,
+        maxDepth: Int,
+        nameMatcher: ((String) -> Boolean)?,
+        contentNeedle: String?,
+        typeFilter: FsType?,
+        caseSensitive: Boolean,
+        results: MutableList<SearchResult>
+    ) {
+        suspend fun scan(relPath: String, depth: Int) {
+            val entries = diskOps.list(relPath).getOrNull() ?: return
+            for (entry in entries) {
+                val childRelPath = if (relPath == "/") "/${entry.name}" else "$relPath/${entry.name}"
+                val virtualPath = "$mountPoint${childRelPath}"
+
+                // 类型过滤
+                if (typeFilter != null && entry.type != typeFilter) {
+                    // 但目录仍需递归搜索
+                    if (entry.type == FsType.DIRECTORY && (maxDepth < 0 || depth + 1 <= maxDepth)) {
+                        scan(childRelPath, depth + 1)
+                    }
+                    continue
+                }
+
+                // 文件名匹配
+                val nameMatched = nameMatcher == null || nameMatcher(entry.name)
+
+                if (nameMatched) {
+                    if (contentNeedle != null && entry.type == FsType.FILE) {
+                        // 内容搜索
+                        val meta = diskOps.stat(childRelPath).getOrNull()
+                        if (meta != null && meta.type == FsType.FILE && meta.size > 0) {
+                            val data = diskOps.readFile(childRelPath, 0, meta.size.toInt()).getOrNull()
+                            if (data != null) {
+                                val matchedLines = grepContent(data, contentNeedle, caseSensitive)
+                                if (matchedLines.isNotEmpty()) {
+                                    results.add(SearchResult(virtualPath, entry.type, meta.size, matchedLines))
+                                }
+                            }
+                        }
+                    } else if (contentNeedle != null && entry.type != FsType.FILE) {
+                        // 内容搜索但非文件，跳过
+                    } else {
+                        val meta = diskOps.stat(childRelPath).getOrNull()
+                        val size = meta?.size ?: 0L
+                        results.add(SearchResult(virtualPath, entry.type, size))
+                    }
+                }
+
+                // 递归进入子目录
+                if (entry.type == FsType.DIRECTORY && (maxDepth < 0 || depth + 1 <= maxDepth)) {
+                    scan(childRelPath, depth + 1)
+                }
+            }
+        }
+
+        scan(diskPath, 0)
+    }
+
+    /**
+     * 在字节内容中搜索匹配行（类 grep）。
+     */
+    private fun grepContent(data: ByteArray, needle: String, caseSensitive: Boolean): List<MatchedLine> {
+        if (data.isEmpty()) return emptyList()
+        val text = data.decodeToString()
+        val lines = text.split('\n')
+        val matched = mutableListOf<MatchedLine>()
+        for ((index, line) in lines.withIndex()) {
+            val haystack = if (caseSensitive) line else line.lowercase()
+            if (haystack.contains(needle)) {
+                matched.add(MatchedLine(index + 1, line))
+            }
+        }
+        return matched
+    }
+
+    /**
+     * 构建 glob 模式匹配器。
+     *
+     * 支持的通配符：
+     * - `*`：匹配任意数量的任意字符
+     * - `?`：匹配单个任意字符
+     */
+    private fun buildGlobMatcher(pattern: String, caseSensitive: Boolean): (String) -> Boolean {
+        // 将 glob 转为正则
+        val regexStr = buildString {
+            append("^")
+            for (ch in pattern) {
+                when (ch) {
+                    '*' -> append(".*")
+                    '?' -> append(".")
+                    '.' -> append("\\.")
+                    '\\' -> append("\\\\")
+                    '[', ']', '(', ')', '{', '}', '^', '$', '|', '+' -> {
+                        append("\\"); append(ch)
+                    }
+                    else -> append(ch)
+                }
+            }
+            append("$")
+        }
+        val options = if (caseSensitive) emptySet() else setOf(RegexOption.IGNORE_CASE)
+        val regex = Regex(regexStr, options)
+        return { name -> regex.matches(name) }
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -798,7 +998,7 @@ internal class InMemoryFileSystem(
             tree.readAt(node, offset, length)
         }
 
-    internal suspend fun writeAt(node: FileNode, offset: Long, data: ByteArray): Result<Unit> =
+    internal suspend fun writeAt(node: FileNode, offset: Long, data: ByteArray, path: String): Result<Unit> =
         locked {
             // 配额检查：计算写入后的净增量
             val end = offset.toInt() + data.size
@@ -808,10 +1008,18 @@ internal class InMemoryFileSystem(
                 return@locked it
             }
 
-            // 版本保存：写入前保存当前内容
-            val path = tree.pathForNode(node)
+            // 版本保存：写入前保存当前内容（仅当内容会真正改变时）
             if (node.size > 0) {
-                versionManager.saveVersion(path, node.blocks.toByteArray())
+                val oldData = node.blocks.toByteArray()
+                // 快速检测：如果写入区域完全相同则跳过版本保存
+                val contentChanged = if (offset == 0L && data.size == oldData.size) {
+                    !data.contentEquals(oldData)
+                } else {
+                    true // 偏移或大小不同，必然有变化
+                }
+                if (contentChanged) {
+                    versionManager.saveVersion(path, oldData)
+                }
             }
 
             tree.writeAt(node, offset, data).also { result ->
