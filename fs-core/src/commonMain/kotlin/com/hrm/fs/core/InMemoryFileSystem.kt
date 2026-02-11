@@ -120,27 +120,7 @@ internal class InMemoryFileSystem(
         val mark = mc.begin()
         val result = locked {
             ensureLoaded()
-            val normalized = PathUtils.normalize(path)
-            val match = mountTable.findMount(normalized)
-            if (match != null) {
-                if (match.options.readOnly) return@locked readOnlyError(normalized)
-                val r = match.diskOps.createFile(match.relativePath)
-                if (r.isSuccess) {
-                    invalidateCache(normalized)
-                    eventBus.emit(normalized, FsEventKind.CREATED)
-                } else {
-                    FLog.w(TAG, "createFile failed (disk): $normalized, error=${r.exceptionOrNull()}")
-                }
-                return@locked r
-            }
-            tree.createFile(normalized).also { r ->
-                if (r.isSuccess) {
-                    walAppend(WalEntry.CreateFile(normalized))
-                    eventBus.emit(normalized, FsEventKind.CREATED)
-                } else {
-                    FLog.w(TAG, "createFile failed: $normalized, error=${r.exceptionOrNull()}")
-                }
-            }
+            createFileNoLock(PathUtils.normalize(path))
         }
         mc.end(Op.CREATE_FILE, mark, result)
         return result
@@ -151,28 +131,7 @@ internal class InMemoryFileSystem(
         val mark = mc.begin()
         val result = locked {
             ensureLoaded()
-            val normalized = PathUtils.normalize(path)
-            if (normalized == "/") return@locked Result.success(Unit)
-            val match = mountTable.findMount(normalized)
-            if (match != null) {
-                if (match.options.readOnly) return@locked readOnlyError(normalized)
-                val r = match.diskOps.createDir(match.relativePath)
-                if (r.isSuccess) {
-                    invalidateCache(normalized)
-                    eventBus.emit(normalized, FsEventKind.CREATED)
-                } else {
-                    FLog.w(TAG, "createDir failed (disk): $normalized, error=${r.exceptionOrNull()}")
-                }
-                return@locked r
-            }
-            tree.createDir(normalized).also { r ->
-                if (r.isSuccess) {
-                    walAppend(WalEntry.CreateDir(normalized))
-                    eventBus.emit(normalized, FsEventKind.CREATED)
-                } else {
-                    FLog.w(TAG, "createDir failed: $normalized, error=${r.exceptionOrNull()}")
-                }
-            }
+            createDirNoLock(PathUtils.normalize(path))
         }
         mc.end(Op.CREATE_DIR, mark, result)
         return result
@@ -183,30 +142,7 @@ internal class InMemoryFileSystem(
         val mark = mc.begin()
         val result = locked {
             ensureLoaded()
-            val normalized = PathUtils.normalize(path)
-            val match = mountTable.findMount(normalized)
-            if (match != null) {
-                if (match.options.readOnly && mode != OpenMode.READ) {
-                    FLog.w(TAG, "open failed: read-only mount $normalized with mode=$mode")
-                    return@locked Result.failure(FsError.PermissionDenied("挂载点只读: $normalized"))
-                }
-                return@locked Result.success(
-                    DiskFileHandle(match.diskOps, match.relativePath, mode, normalized, fileLockManager)
-                )
-            }
-            val node = tree.resolveNodeOrError(normalized).getOrElse {
-                FLog.w(TAG, "open failed: $normalized not found")
-                return@locked Result.failure(it)
-            }
-            if (node !is FileNode) {
-                FLog.w(TAG, "open failed: $normalized is not a file")
-                return@locked Result.failure(FsError.NotFile(normalized))
-            }
-            if (!hasAccess(node.permissions, mode)) {
-                FLog.w(TAG, "open failed: permission denied for $normalized")
-                return@locked Result.failure(FsError.PermissionDenied(normalized))
-            }
-            Result.success(InMemoryFileHandle(this, node, mode, normalized, fileLockManager))
+            openNoLock(PathUtils.normalize(path), mode)
         }
         mc.end(Op.OPEN, mark, result)
         return result
@@ -216,15 +152,7 @@ internal class InMemoryFileSystem(
         val mark = mc.begin()
         val result = locked {
             ensureLoaded()
-            val normalized = PathUtils.normalize(path)
-            val match = mountTable.findMount(normalized)
-            if (match != null) {
-                readDirCache.get(normalized)?.let { return@locked Result.success(it) }
-                val r = match.diskOps.list(match.relativePath)
-                if (r.isSuccess) readDirCache.put(normalized, r.getOrThrow())
-                return@locked r
-            }
-            tree.readDir(normalized)
+            readDirNoLock(PathUtils.normalize(path))
         }
         mc.end(Op.READ_DIR, mark, result)
         return result
@@ -234,15 +162,7 @@ internal class InMemoryFileSystem(
         val mark = mc.begin()
         val result = locked {
             ensureLoaded()
-            val normalized = PathUtils.normalize(path)
-            val match = mountTable.findMount(normalized)
-            if (match != null) {
-                statCache.get(normalized)?.let { return@locked Result.success(it) }
-                val r = match.diskOps.stat(match.relativePath).map { it.copy(path = normalized) }
-                if (r.isSuccess) statCache.put(normalized, r.getOrThrow())
-                return@locked r
-            }
-            tree.stat(normalized)
+            statNoLock(PathUtils.normalize(path))
         }
         mc.end(Op.STAT, mark, result)
         return result
@@ -253,39 +173,7 @@ internal class InMemoryFileSystem(
         val mark = mc.begin()
         val result = locked {
             ensureLoaded()
-            val normalized = PathUtils.normalize(path)
-            if (normalized == "/") {
-                FLog.w(TAG, "delete failed: cannot delete root")
-                return@locked Result.failure(FsError.PermissionDenied("/"))
-            }
-            if (mountTable.isMountPoint(normalized)) {
-                FLog.w(TAG, "delete failed: cannot delete mount point $normalized")
-                return@locked Result.failure(FsError.PermissionDenied("不能删除挂载点: $normalized"))
-            }
-            if (fileLockManager.isLocked(normalized)) {
-                FLog.w(TAG, "delete failed: file locked $normalized")
-                return@locked Result.failure(FsError.Locked(normalized))
-            }
-            val match = mountTable.findMount(normalized)
-            if (match != null) {
-                if (match.options.readOnly) return@locked readOnlyError(normalized)
-                val r = match.diskOps.delete(match.relativePath)
-                if (r.isSuccess) {
-                    invalidateCache(normalized)
-                    eventBus.emit(normalized, FsEventKind.DELETED)
-                } else {
-                    FLog.w(TAG, "delete failed (disk): $normalized, error=${r.exceptionOrNull()}")
-                }
-                return@locked r
-            }
-            tree.delete(normalized).also { r ->
-                if (r.isSuccess) {
-                    walAppend(WalEntry.Delete(normalized))
-                    eventBus.emit(normalized, FsEventKind.DELETED)
-                } else {
-                    FLog.w(TAG, "delete failed: $normalized, error=${r.exceptionOrNull()}")
-                }
-            }
+            deleteNoLock(PathUtils.normalize(path))
         }
         mc.end(Op.DELETE, mark, result)
         return result
@@ -308,17 +196,229 @@ internal class InMemoryFileSystem(
     }
 
     // ═══════════════════════════════════════════════════════════
-    // 递归操作
+    // 递归操作（原子：单次 locked 内完成）
     // ═══════════════════════════════════════════════════════════
 
     override suspend fun createDirRecursive(path: String): Result<Unit> {
-        val normalized = PathUtils.normalize(path)
+        return locked {
+            ensureLoaded()
+            createDirRecursiveNoLock(PathUtils.normalize(path))
+        }
+    }
+
+    override suspend fun deleteRecursive(path: String): Result<Unit> {
+        return locked {
+            ensureLoaded()
+            deleteRecursiveNoLock(PathUtils.normalize(path))
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 便捷读写
+    // ═══════════════════════════════════════════════════════════
+
+    override suspend fun readAll(path: String): Result<ByteArray> {
+        val mark = mc.begin()
+        val result = locked {
+            ensureLoaded()
+            val normalized = PathUtils.normalize(path)
+            val data = readAllBytes(normalized)
+            if (data.isSuccess) mc.addBytesRead(data.getOrThrow().size.toLong())
+            data
+        }
+        mc.end(Op.READ_ALL, mark, result)
+        return result
+    }
+
+    override suspend fun writeAll(path: String, data: ByteArray): Result<Unit> {
+        FLog.d(TAG, "writeAll: path=$path, size=${data.size}")
+        val mark = mc.begin()
+        val result = locked {
+            ensureLoaded()
+            writeAllNoLock(PathUtils.normalize(path), data)
+        }
+        mc.end(Op.WRITE_ALL, mark, result)
+        return result
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // copy / move（原子：单次 locked 内完成）
+    // ═══════════════════════════════════════════════════════════
+
+    override suspend fun copy(srcPath: String, dstPath: String): Result<Unit> {
+        FLog.d(TAG, "copy: src=$srcPath, dst=$dstPath")
+        val mark = mc.begin()
+        val result = locked {
+            ensureLoaded()
+            val src = PathUtils.normalize(srcPath)
+            val dst = PathUtils.normalize(dstPath)
+            copyNoLock(src, dst).also { r ->
+                if (r.isSuccess) walAppend(WalEntry.Copy(src, dst))
+            }
+        }
+        if (result.isFailure) FLog.w(TAG, "copy failed: src=$srcPath, dst=$dstPath, error=${result.exceptionOrNull()}")
+        mc.end(Op.COPY, mark, result)
+        return result
+    }
+
+    override suspend fun move(srcPath: String, dstPath: String): Result<Unit> {
+        FLog.d(TAG, "move: src=$srcPath, dst=$dstPath")
+        val mark = mc.begin()
+        val result = locked {
+            ensureLoaded()
+            val src = PathUtils.normalize(srcPath)
+            val dst = PathUtils.normalize(dstPath)
+            copyNoLock(src, dst).getOrElse { return@locked Result.failure(it) }
+            deleteRecursiveNoLock(src).also { r ->
+                if (r.isSuccess) walAppend(WalEntry.Move(src, dst))
+            }
+        }
+        if (result.isFailure) FLog.w(TAG, "move failed: src=$srcPath, dst=$dstPath, error=${result.exceptionOrNull()}")
+        mc.end(Op.MOVE, mark, result)
+        return result
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // 无锁内部方法（在 locked {} 内调用）
+    // ═══════════════════════════════════════════════════════════
+
+    private suspend fun createFileNoLock(normalized: String): Result<Unit> {
+        val match = mountTable.findMount(normalized)
+        if (match != null) {
+            if (match.options.readOnly) return readOnlyError(normalized)
+            val r = match.diskOps.createFile(match.relativePath)
+            if (r.isSuccess) {
+                invalidateCache(normalized)
+                eventBus.emit(normalized, FsEventKind.CREATED)
+            } else {
+                FLog.w(TAG, "createFile failed (disk): $normalized, error=${r.exceptionOrNull()}")
+            }
+            return r
+        }
+        return tree.createFile(normalized).also { r ->
+            if (r.isSuccess) {
+                walAppend(WalEntry.CreateFile(normalized))
+                eventBus.emit(normalized, FsEventKind.CREATED)
+            } else {
+                FLog.w(TAG, "createFile failed: $normalized, error=${r.exceptionOrNull()}")
+            }
+        }
+    }
+
+    private suspend fun createDirNoLock(normalized: String): Result<Unit> {
+        if (normalized == "/") return Result.success(Unit)
+        val match = mountTable.findMount(normalized)
+        if (match != null) {
+            if (match.options.readOnly) return readOnlyError(normalized)
+            val r = match.diskOps.createDir(match.relativePath)
+            if (r.isSuccess) {
+                invalidateCache(normalized)
+                eventBus.emit(normalized, FsEventKind.CREATED)
+            } else {
+                FLog.w(TAG, "createDir failed (disk): $normalized, error=${r.exceptionOrNull()}")
+            }
+            return r
+        }
+        return tree.createDir(normalized).also { r ->
+            if (r.isSuccess) {
+                walAppend(WalEntry.CreateDir(normalized))
+                eventBus.emit(normalized, FsEventKind.CREATED)
+            } else {
+                FLog.w(TAG, "createDir failed: $normalized, error=${r.exceptionOrNull()}")
+            }
+        }
+    }
+
+    private suspend fun openNoLock(normalized: String, mode: OpenMode): Result<FileHandle> {
+        val match = mountTable.findMount(normalized)
+        if (match != null) {
+            if (match.options.readOnly && mode != OpenMode.READ) {
+                FLog.w(TAG, "open failed: read-only mount $normalized with mode=$mode")
+                return Result.failure(FsError.PermissionDenied("挂载点只读: $normalized"))
+            }
+            return Result.success(
+                DiskFileHandle(match.diskOps, match.relativePath, mode, normalized, fileLockManager)
+            )
+        }
+        val node = tree.resolveNodeOrError(normalized).getOrElse {
+            FLog.w(TAG, "open failed: $normalized not found")
+            return Result.failure(it)
+        }
+        if (node !is FileNode) {
+            FLog.w(TAG, "open failed: $normalized is not a file")
+            return Result.failure(FsError.NotFile(normalized))
+        }
+        if (!hasAccess(node.permissions, mode)) {
+            FLog.w(TAG, "open failed: permission denied for $normalized")
+            return Result.failure(FsError.PermissionDenied(normalized))
+        }
+        return Result.success(InMemoryFileHandle(this, node, mode, normalized, fileLockManager))
+    }
+
+    private suspend fun readDirNoLock(normalized: String): Result<List<FsEntry>> {
+        val match = mountTable.findMount(normalized)
+        if (match != null) {
+            readDirCache.get(normalized)?.let { return Result.success(it) }
+            val r = match.diskOps.list(match.relativePath)
+            if (r.isSuccess) readDirCache.put(normalized, r.getOrThrow())
+            return r
+        }
+        return tree.readDir(normalized)
+    }
+
+    private suspend fun statNoLock(normalized: String): Result<FsMeta> {
+        val match = mountTable.findMount(normalized)
+        if (match != null) {
+            statCache.get(normalized)?.let { return Result.success(it) }
+            val r = match.diskOps.stat(match.relativePath).map { it.copy(path = normalized) }
+            if (r.isSuccess) statCache.put(normalized, r.getOrThrow())
+            return r
+        }
+        return tree.stat(normalized)
+    }
+
+    private suspend fun deleteNoLock(normalized: String): Result<Unit> {
+        if (normalized == "/") {
+            FLog.w(TAG, "delete failed: cannot delete root")
+            return Result.failure(FsError.PermissionDenied("/"))
+        }
+        if (mountTable.isMountPoint(normalized)) {
+            FLog.w(TAG, "delete failed: cannot delete mount point $normalized")
+            return Result.failure(FsError.PermissionDenied("不能删除挂载点: $normalized"))
+        }
+        if (fileLockManager.isLocked(normalized)) {
+            FLog.w(TAG, "delete failed: file locked $normalized")
+            return Result.failure(FsError.Locked(normalized))
+        }
+        val match = mountTable.findMount(normalized)
+        if (match != null) {
+            if (match.options.readOnly) return readOnlyError(normalized)
+            val r = match.diskOps.delete(match.relativePath)
+            if (r.isSuccess) {
+                invalidateCache(normalized)
+                eventBus.emit(normalized, FsEventKind.DELETED)
+            } else {
+                FLog.w(TAG, "delete failed (disk): $normalized, error=${r.exceptionOrNull()}")
+            }
+            return r
+        }
+        return tree.delete(normalized).also { r ->
+            if (r.isSuccess) {
+                walAppend(WalEntry.Delete(normalized))
+                eventBus.emit(normalized, FsEventKind.DELETED)
+            } else {
+                FLog.w(TAG, "delete failed: $normalized, error=${r.exceptionOrNull()}")
+            }
+        }
+    }
+
+    private suspend fun createDirRecursiveNoLock(normalized: String): Result<Unit> {
         if (normalized == "/") return Result.success(Unit)
         val parts = normalized.removePrefix("/").split("/")
         var current = ""
         for (part in parts) {
             current = "$current/$part"
-            val result = createDir(current)
+            val result = createDirNoLock(current)
             if (result.isFailure) {
                 val err = result.exceptionOrNull()
                 if (err is FsError.AlreadyExists) continue
@@ -328,137 +428,83 @@ internal class InMemoryFileSystem(
         return Result.success(Unit)
     }
 
-    override suspend fun deleteRecursive(path: String): Result<Unit> {
-        val normalized = PathUtils.normalize(path)
+    private suspend fun deleteRecursiveNoLock(normalized: String): Result<Unit> {
         if (normalized == "/") return Result.failure(FsError.PermissionDenied("/"))
         if (mountTable.isMountPoint(normalized)) {
             return Result.failure(FsError.PermissionDenied("不能删除挂载点: $normalized"))
         }
-        val meta = stat(normalized).getOrElse { return Result.failure(it) }
-        val lmeta = locked { tree.lstat(normalized) }.getOrNull()
-        if (lmeta != null && lmeta.type == FsType.SYMLINK) return delete(normalized)
-        if (meta.type == FsType.FILE) return delete(normalized)
-        val entries = readDir(normalized).getOrElse { return Result.failure(it) }
+        val meta = statNoLock(normalized).getOrElse { return Result.failure(it) }
+        val lmeta = tree.lstat(normalized).getOrNull()
+        if (lmeta != null && lmeta.type == FsType.SYMLINK) return deleteNoLock(normalized)
+        if (meta.type == FsType.FILE) return deleteNoLock(normalized)
+        val entries = readDirNoLock(normalized).getOrElse { return Result.failure(it) }
         for (entry in entries) {
             val childPath = if (normalized == "/") "/${entry.name}" else "$normalized/${entry.name}"
-            deleteRecursive(childPath).getOrElse { return Result.failure(it) }
+            deleteRecursiveNoLock(childPath).getOrElse { return Result.failure(it) }
         }
-        return delete(normalized)
+        return deleteNoLock(normalized)
     }
 
-    // ═══════════════════════════════════════════════════════════
-    // 便捷读写
-    // ═══════════════════════════════════════════════════════════
-
-    override suspend fun readAll(path: String): Result<ByteArray> {
-        val mark = mc.begin()
-        val handle = open(path, OpenMode.READ).getOrElse {
-            val fail = Result.failure<ByteArray>(it)
-            mc.end(Op.READ_ALL, mark, fail)
-            return fail
-        }
-        val result = try {
-            val meta = stat(path).getOrElse { return Result.failure(it) }
-            val r = handle.readAt(0, meta.size.toInt())
-            if (r.isSuccess) mc.addBytesRead(r.getOrThrow().size.toLong())
-            r
-        } finally {
-            handle.close()
-        }
-        mc.end(Op.READ_ALL, mark, result)
-        return result
-    }
-
-    override suspend fun writeAll(path: String, data: ByteArray): Result<Unit> {
-        FLog.d(TAG, "writeAll: path=$path, size=${data.size}")
-        val mark = mc.begin()
-        val normalized = PathUtils.normalize(path)
+    private suspend fun writeAllNoLock(normalized: String, data: ByteArray): Result<Unit> {
         val parentPath = normalized.substringBeforeLast('/', "/")
         if (parentPath != "/") {
-            createDirRecursive(parentPath).getOrElse {
-                val fail = Result.failure<Unit>(it)
-                mc.end(Op.WRITE_ALL, mark, fail)
-                return fail
-            }
+            createDirRecursiveNoLock(parentPath).getOrElse { return Result.failure(it) }
         }
-        if (stat(normalized).isFailure) {
-            createFile(normalized).getOrElse {
-                val fail = Result.failure<Unit>(it)
-                mc.end(Op.WRITE_ALL, mark, fail)
-                return fail
-            }
+        if (statNoLock(normalized).isFailure) {
+            createFileNoLock(normalized).getOrElse { return Result.failure(it) }
         }
 
-        val match = locked { mountTable.findMount(normalized) }
+        val match = mountTable.findMount(normalized)
         if (match != null) {
-            locked {
-                val currentData = readAllBytes(normalized).getOrNull()
-                if (currentData != null && currentData.isNotEmpty()) {
-                    versionManager.saveVersion(normalized, currentData)
-                }
+            val currentData = readAllBytes(normalized).getOrNull()
+            if (currentData != null && currentData.isNotEmpty()) {
+                versionManager.saveVersion(normalized, currentData)
             }
-        }
-
-        val handle = open(normalized, OpenMode.WRITE).getOrElse {
-            val fail = Result.failure<Unit>(it)
-            mc.end(Op.WRITE_ALL, mark, fail)
-            return fail
-        }
-        val result = try {
-            val r = handle.writeAt(0, data)
+            // 挂载点写入：通过 diskOps 直接写
+            val r = match.diskOps.writeFile(match.relativePath, 0, data)
             if (r.isSuccess) {
                 mc.addBytesWritten(data.size.toLong())
                 invalidateCache(normalized)
                 eventBus.emit(normalized, FsEventKind.MODIFIED)
             }
-            r
-        } finally {
-            handle.close()
+            return r
         }
-        mc.end(Op.WRITE_ALL, mark, result)
-        return result
-    }
 
-    // ═══════════════════════════════════════════════════════════
-    // copy / move
-    // ═══════════════════════════════════════════════════════════
-
-    override suspend fun copy(srcPath: String, dstPath: String): Result<Unit> {
-        FLog.d(TAG, "copy: src=$srcPath, dst=$dstPath")
-        val mark = mc.begin()
-        val result = copyInternal(srcPath, dstPath)
-        if (result.isFailure) FLog.w(TAG, "copy failed: src=$srcPath, dst=$dstPath, error=${result.exceptionOrNull()}")
-        mc.end(Op.COPY, mark, result)
-        return result
-    }
-
-    private suspend fun copyInternal(srcPath: String, dstPath: String): Result<Unit> {
-        val src = PathUtils.normalize(srcPath)
-        val dst = PathUtils.normalize(dstPath)
-        val meta = stat(src).getOrElse { return Result.failure(it) }
-        if (meta.type == FsType.FILE) {
-            val data = readAll(src).getOrElse { return Result.failure(it) }
-            return writeAll(dst, data)
+        // VFS 内存文件写入
+        val node = tree.resolveNodeOrError(normalized).getOrElse { return Result.failure(it) }
+        if (node !is FileNode) return Result.failure(FsError.NotFile(normalized))
+        if (!node.permissions.canWrite()) return Result.failure(FsError.PermissionDenied(normalized))
+        val end = data.size.toLong()
+        val growth = maxOf(0L, end - node.size.toLong())
+        checkQuota(growth)?.let { return it }
+        if (node.size > 0) {
+            val oldData = node.blocks.toByteArray()
+            versionManager.saveVersion(normalized, oldData)
         }
-        createDirRecursive(dst).getOrElse { return Result.failure(it) }
-        val entries = readDir(src).getOrElse { return Result.failure(it) }
-        for (entry in entries) {
-            copyInternal("$src/${entry.name}", "$dst/${entry.name}")
-                .getOrElse { return Result.failure(it) }
+        tree.writeAt(node, 0, data).also { result ->
+            if (result.isSuccess) {
+                walAppend(WalEntry.Write(normalized, 0, data))
+                mc.addBytesWritten(data.size.toLong())
+                invalidateCache(normalized)
+                eventBus.emit(normalized, FsEventKind.MODIFIED)
+            }
         }
         return Result.success(Unit)
     }
 
-    override suspend fun move(srcPath: String, dstPath: String): Result<Unit> {
-        FLog.d(TAG, "move: src=$srcPath, dst=$dstPath")
-        val mark = mc.begin()
-        val result = run {
-            copyInternal(srcPath, dstPath).getOrElse { return@run Result.failure(it) }
-            deleteRecursive(srcPath)
+    private suspend fun copyNoLock(src: String, dst: String): Result<Unit> {
+        val meta = statNoLock(src).getOrElse { return Result.failure(it) }
+        if (meta.type == FsType.FILE) {
+            val data = readAllBytes(src).getOrElse { return Result.failure(it) }
+            return writeAllNoLock(dst, data)
         }
-        if (result.isFailure) FLog.w(TAG, "move failed: src=$srcPath, dst=$dstPath, error=${result.exceptionOrNull()}")
-        mc.end(Op.MOVE, mark, result)
-        return result
+        createDirRecursiveNoLock(dst).getOrElse { return Result.failure(it) }
+        val entries = readDirNoLock(src).getOrElse { return Result.failure(it) }
+        for (entry in entries) {
+            copyNoLock("$src/${entry.name}", "$dst/${entry.name}")
+                .getOrElse { return Result.failure(it) }
+        }
+        return Result.success(Unit)
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -985,7 +1031,10 @@ internal class InMemoryFileSystem(
                 when (resolvedFormat) {
                     ArchiveFormat.ZIP -> {
                         for (entry in ArchiveCodec.zipDecode(archiveData)) {
-                            val path = "$normalizedTarget/${entry.path}"
+                            val path = PathUtils.normalize("$normalizedTarget/${entry.path}")
+                            if (path != normalizedTarget && !path.startsWith("$normalizedTarget/")) {
+                                return Result.failure(FsError.PermissionDenied("Zip Slip: ${entry.path}"))
+                            }
                             if (entry.isDirectory) {
                                 createDirRecursive(path).getOrElse { return Result.failure(it) }
                             } else {
@@ -995,7 +1044,10 @@ internal class InMemoryFileSystem(
                     }
                     ArchiveFormat.TAR -> {
                         for (entry in ArchiveCodec.tarDecode(archiveData)) {
-                            val path = "$normalizedTarget/${entry.path}"
+                            val path = PathUtils.normalize("$normalizedTarget/${entry.path}")
+                            if (path != normalizedTarget && !path.startsWith("$normalizedTarget/")) {
+                                return Result.failure(FsError.PermissionDenied("Zip Slip (TAR): ${entry.path}"))
+                            }
                             if (entry.isDirectory) {
                                 createDirRecursive(path).getOrElse { return Result.failure(it) }
                             } else {

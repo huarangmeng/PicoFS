@@ -573,6 +573,11 @@ internal class VfsTree {
 
                 is WalEntry.SetXattr -> setXattrInternal(entry.path, entry.name, entry.value)
                 is WalEntry.RemoveXattr -> removeXattrInternal(entry.path, entry.name)
+                is WalEntry.Copy -> copyInternal(entry.src, entry.dst)
+                is WalEntry.Move -> {
+                    copyInternal(entry.src, entry.dst)
+                    deleteRecursiveInternal(entry.src)
+                }
                 is WalEntry.MoveToTrash -> { deleteRecursiveInternal(entry.path) }
                 is WalEntry.RestoreFromTrash -> { /* tree 变更由 restore 后的操作完成 */ }
             }
@@ -607,13 +612,18 @@ internal class VfsTree {
                 xattrs = xattrs
             )
 
-            is FileNode -> SnapshotNode(
-                name = node.name, type = node.type.name,
-                createdAtMillis = node.createdAtMillis, modifiedAtMillis = node.modifiedAtMillis,
-                permissions = SnapshotPermissions.from(node.permissions),
-                content = node.blocks.toByteArray(),
-                xattrs = xattrs
-            )
+            is FileNode -> {
+                // 直接引用 blocks 的底层数据，避免额外拷贝导致内存翻倍。
+                // SnapshotNode 在序列化后即被 GC，期间 tree 持有锁不会被修改。
+                val contentRef = node.blocks.toByteArray()
+                SnapshotNode(
+                    name = node.name, type = node.type.name,
+                    createdAtMillis = node.createdAtMillis, modifiedAtMillis = node.modifiedAtMillis,
+                    permissions = SnapshotPermissions.from(node.permissions),
+                    content = contentRef,
+                    xattrs = xattrs
+                )
+            }
 
             is SymlinkNode -> SnapshotNode(
                 name = node.name, type = node.type.name,
@@ -669,6 +679,39 @@ internal class VfsTree {
             nowMillis(),
             FsPermissions.FULL
         )
+    }
+
+    /** WAL 回放用：递归拷贝节点（静默，不抛异常）。 */
+    private fun copyInternal(src: String, dst: String) {
+        val srcNorm = PathUtils.normalize(src)
+        val dstNorm = PathUtils.normalize(dst)
+        val srcNode = resolveNode(srcNorm) ?: return
+        copyNodeRecursive(srcNode, dstNorm)
+    }
+
+    private fun copyNodeRecursive(node: VfsNode, dstPath: String) {
+        when (node) {
+            is FileNode -> {
+                createFileInternal(dstPath)
+                val created = resolveNode(dstPath) as? FileNode ?: return
+                val data = node.blocks.toByteArray()
+                if (data.isNotEmpty()) {
+                    val oldSize = created.size.toLong()
+                    created.blocks.write(0, data)
+                    _usedBytes += created.size.toLong() - oldSize
+                    created.modifiedAtMillis = nowMillis()
+                }
+            }
+            is DirNode -> {
+                createDirInternal(dstPath)
+                for ((name, child) in node.children) {
+                    copyNodeRecursive(child, "$dstPath/$name")
+                }
+            }
+            is SymlinkNode -> {
+                createSymlinkInternal(dstPath, node.targetPath)
+            }
+        }
     }
 
     private fun createFileInternal(path: String) {

@@ -37,6 +37,7 @@ import platform.Foundation.readDataToEndOfFile
 import platform.Foundation.seekToFileOffset
 import platform.Foundation.stringByAppendingPathComponent
 import platform.Foundation.stringByDeletingLastPathComponent
+import platform.Foundation.stringByStandardizingPath
 import platform.Foundation.timeIntervalSince1970
 import platform.Foundation.writeData
 import platform.posix.memcpy
@@ -52,10 +53,21 @@ internal class IosDiskFileOperations(override val rootPath: String) : DiskFileOp
 
     private val fm = NSFileManager.defaultManager
 
+    /**
+     * 解析路径并验证不越界。
+     *
+     * iOS 没有 Java 的 canonicalPath，使用 NSString.stringByStandardizingPath 展开 `..` 和 `.`。
+     */
     private fun resolve(path: String): String {
         val rel = path.removePrefix("/")
-        return if (rel.isEmpty()) rootPath
+        val full = if (rel.isEmpty()) rootPath
         else (rootPath as NSString).stringByAppendingPathComponent(rel)
+        val canonical = (full as NSString).stringByStandardizingPath
+        val rootCanonical = (rootPath as NSString).stringByStandardizingPath
+        if (canonical != rootCanonical && !canonical.startsWith("$rootCanonical/")) {
+            throw FsError.PermissionDenied("路径越界: $path")
+        }
+        return full
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -282,11 +294,21 @@ internal class IosDiskFileOperations(override val rootPath: String) : DiskFileOp
 
         val targetFull = resolve(targetDir)
         fm.createDirectoryAtPath(targetFull, withIntermediateDirectories = true, attributes = null, error = null)
+        val targetCanonical = (targetFull as NSString).stringByStandardizingPath
+
+        fun validateEntryPath(entryPath: String): String {
+            val full = (targetFull as NSString).stringByAppendingPathComponent(entryPath)
+            val canonical = (full as NSString).stringByStandardizingPath
+            if (canonical != targetCanonical && !canonical.startsWith("$targetCanonical/")) {
+                throw FsError.PermissionDenied("Zip Slip: $entryPath")
+            }
+            return full
+        }
 
         when (resolvedFormat) {
             ArchiveFormat.ZIP -> {
                 for (entry in ArchiveCodec.zipDecode(archiveData)) {
-                    val entryFull = (targetFull as NSString).stringByAppendingPathComponent(entry.path)
+                    val entryFull = validateEntryPath(entry.path)
                     if (entry.isDirectory) {
                         fm.createDirectoryAtPath(entryFull, withIntermediateDirectories = true, attributes = null, error = null)
                     } else {
@@ -301,7 +323,7 @@ internal class IosDiskFileOperations(override val rootPath: String) : DiskFileOp
             }
             ArchiveFormat.TAR -> {
                 for (entry in ArchiveCodec.tarDecode(archiveData)) {
-                    val entryFull = (targetFull as NSString).stringByAppendingPathComponent(entry.path)
+                    val entryFull = validateEntryPath(entry.path)
                     if (entry.isDirectory) {
                         fm.createDirectoryAtPath(entryFull, withIntermediateDirectories = true, attributes = null, error = null)
                     } else {

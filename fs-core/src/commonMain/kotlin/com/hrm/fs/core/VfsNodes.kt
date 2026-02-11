@@ -89,9 +89,7 @@ internal class BlockStorage(
             val blockOffset = srcOffset % blockSize
             val block = if (blockIndex < blockList.size) blockList[blockIndex] else null
             val copyLen = minOf(remaining, blockSize - blockOffset)
-            if (block != null) {
-                block.copyInto(out, dstOffset, blockOffset, blockOffset + copyLen)
-            }
+            block?.copyInto(out, dstOffset, blockOffset, blockOffset + copyLen)
             // 如果 block 为 null（稀疏区域），out 中该段保持全零
             srcOffset += copyLen
             dstOffset += copyLen
@@ -152,10 +150,12 @@ internal class BlockStorage(
  *
  * @param versionId 唯一标识
  * @param timestampMillis 保存时间
- * @param data 该版本的完整文件内容
+ * @param data 该版本的数据（base 版本为完整内容，delta 版本为 XOR 差异）
+ * @param isBase 是否为基准版本（完整数据）。false 表示 delta 编码。
  */
 internal data class VersionSnapshot(
     val versionId: String,
     val timestampMillis: Long,
-    val data: ByteArray
+    val data: ByteArray,
+    val isBase: Boolean = true
 )

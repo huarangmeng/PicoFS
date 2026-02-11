@@ -41,9 +41,16 @@ internal class JvmDiskFileOperations(override val rootPath: String) : DiskFileOp
         private const val TAG = "JvmDiskOps"
     }
 
+    private val rootCanonical: String = File(rootPath).canonicalPath
+
     private fun resolve(path: String): File {
         val rel = path.removePrefix("/")
-        return if (rel.isEmpty()) File(rootPath) else File(rootPath, rel)
+        val file = if (rel.isEmpty()) File(rootPath) else File(rootPath, rel)
+        val canonical = file.canonicalPath
+        if (canonical != rootCanonical && !canonical.startsWith("$rootCanonical${File.separator}")) {
+            throw FsError.PermissionDenied("路径越界: $path")
+        }
+        return file
     }
 
     // ═══════════════════════════════════════════════════════════
@@ -328,10 +335,15 @@ internal class JvmDiskFileOperations(override val rootPath: String) : DiskFileOp
     }
 
     private fun zipExtract(archiveFile: File, targetDir: File) {
+        val targetCanonical = targetDir.canonicalPath
         java.util.zip.ZipInputStream(archiveFile.inputStream().buffered()).use { zis ->
             var entry = zis.nextEntry
             while (entry != null) {
                 val outFile = File(targetDir, entry.name)
+                val outCanonical = outFile.canonicalPath
+                if (!outCanonical.startsWith("$targetCanonical${File.separator}") && outCanonical != targetCanonical) {
+                    throw FsError.PermissionDenied("Zip Slip: ${entry.name}")
+                }
                 if (entry.isDirectory) {
                     outFile.mkdirs()
                 } else {
@@ -416,6 +428,7 @@ internal class JvmDiskFileOperations(override val rootPath: String) : DiskFileOp
     }
 
     private fun tarExtract(archiveFile: File, targetDir: File) {
+        val targetCanonical = targetDir.canonicalPath
         archiveFile.inputStream().buffered().use { input ->
             val headerBuf = ByteArray(512)
             while (true) {
@@ -432,6 +445,10 @@ internal class JvmDiskFileOperations(override val rootPath: String) : DiskFileOp
                 val isDir = typeFlag == '5'.code.toByte() || name.endsWith("/")
 
                 val outFile = File(targetDir, name.trimEnd('/'))
+                val outCanonical = outFile.canonicalPath
+                if (!outCanonical.startsWith("$targetCanonical${File.separator}") && outCanonical != targetCanonical) {
+                    throw FsError.PermissionDenied("Zip Slip (TAR): $name")
+                }
                 if (isDir) {
                     outFile.mkdirs()
                 } else {
