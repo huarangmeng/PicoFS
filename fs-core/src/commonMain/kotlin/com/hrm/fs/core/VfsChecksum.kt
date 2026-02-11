@@ -26,7 +26,7 @@ internal object VfsChecksum {
     // ── SHA-256 ─────────────────────────────────────────────────
 
     private val SHA256_K = intArrayOf(
-        0x428a2f98.toInt(), 0x71374491, 0xb5c0fbcf.toInt(), 0xe9b5dba5.toInt(),
+        0x428a2f98, 0x71374491, 0xb5c0fbcf.toInt(), 0xe9b5dba5.toInt(),
         0x3956c25b, 0x59f111f1, 0x923f82a4.toInt(), 0xab1c5ed5.toInt(),
         0xd807aa98.toInt(), 0x12835b01, 0x243185be, 0x550c7dc3,
         0x72be5d74, 0x80deb1fe.toInt(), 0x9bdc06a7.toInt(), 0xc19bf174.toInt(),
