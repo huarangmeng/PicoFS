@@ -1,5 +1,8 @@
 package com.hrm.fs.platform
 
+import com.hrm.fs.api.ArchiveCodec
+import com.hrm.fs.api.ArchiveEntry
+import com.hrm.fs.api.ArchiveFormat
 import com.hrm.fs.api.DiskFileEvent
 import com.hrm.fs.api.DiskFileOperations
 import com.hrm.fs.api.DiskFileWatcher
@@ -30,6 +33,7 @@ import platform.Foundation.create
 import platform.Foundation.fileHandleForReadingAtPath
 import platform.Foundation.fileHandleForWritingAtPath
 import platform.Foundation.readDataOfLength
+import platform.Foundation.readDataToEndOfFile
 import platform.Foundation.seekToFileOffset
 import platform.Foundation.stringByAppendingPathComponent
 import platform.Foundation.stringByDeletingLastPathComponent
@@ -218,6 +222,155 @@ internal class IosDiskFileOperations(override val rootPath: String) : DiskFileOp
             memcpy(pinned.addressOf(0), this.bytes, this.length)
         }
         return bytes
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // Archive — 基于 ArchiveCodec（纯 Kotlin，无平台依赖）
+    // ═══════════════════════════════════════════════════════════
+
+    @OptIn(ExperimentalForeignApi::class, BetaInteropApi::class)
+    override suspend fun compress(
+        sourcePaths: List<String>,
+        archivePath: String,
+        format: ArchiveFormat
+    ): Result<Unit> = runCatching {
+        val items = mutableListOf<ArchiveCodec.ArchiveItem>()
+        for (srcPath in sourcePaths) {
+            val full = resolve(srcPath)
+            if (!fm.fileExistsAtPath(full)) throw FsError.NotFound(srcPath)
+            collectArchiveItems(full, srcPath.removePrefix("/").substringAfterLast('/').ifEmpty { srcPath.removePrefix("/") }, items)
+        }
+        val archiveData = when (format) {
+            ArchiveFormat.ZIP -> ArchiveCodec.zipEncode(items)
+            ArchiveFormat.TAR -> ArchiveCodec.tarEncode(items)
+        }
+        val archiveFull = resolve(archivePath)
+        val parent = (archiveFull as NSString).stringByDeletingLastPathComponent()
+        fm.createDirectoryAtPath(parent, withIntermediateDirectories = true, attributes = null, error = null)
+        val nsData = archiveData.usePinned { pinned ->
+            NSData.create(bytes = pinned.addressOf(0), length = archiveData.size.toULong())
+        }
+        if (!fm.createFileAtPath(archiveFull, contents = nsData, attributes = null)) {
+            if (fm.fileExistsAtPath(archiveFull)) {
+                val handle = NSFileHandle.fileHandleForWritingAtPath(archiveFull)
+                    ?: throw FsError.Unknown("无法写入归档文件: $archivePath")
+                handle.seekToFileOffset(0u)
+                handle.writeData(nsData)
+                handle.closeFile()
+            } else {
+                throw FsError.Unknown("创建归档文件失败: $archivePath")
+            }
+        }
+    }
+
+    @OptIn(ExperimentalForeignApi::class)
+    override suspend fun extract(
+        archivePath: String,
+        targetDir: String,
+        format: ArchiveFormat?
+    ): Result<Unit> = runCatching {
+        val archiveFull = resolve(archivePath)
+        if (!fm.fileExistsAtPath(archiveFull)) throw FsError.NotFound(archivePath)
+        val handle = NSFileHandle.fileHandleForReadingAtPath(archiveFull)
+            ?: throw FsError.NotFound(archivePath)
+        val nsData = handle.readDataToEndOfFile()
+        handle.closeFile()
+        val archiveData = nsData.toByteArray()
+
+        val resolvedFormat = format ?: ArchiveCodec.detectFormat(archiveData)
+            ?: throw FsError.Unknown("无法检测归档格式")
+
+        val targetFull = resolve(targetDir)
+        fm.createDirectoryAtPath(targetFull, withIntermediateDirectories = true, attributes = null, error = null)
+
+        when (resolvedFormat) {
+            ArchiveFormat.ZIP -> {
+                for (entry in ArchiveCodec.zipDecode(archiveData)) {
+                    val entryFull = (targetFull as NSString).stringByAppendingPathComponent(entry.path)
+                    if (entry.isDirectory) {
+                        fm.createDirectoryAtPath(entryFull, withIntermediateDirectories = true, attributes = null, error = null)
+                    } else {
+                        val parentDir = (entryFull as NSString).stringByDeletingLastPathComponent()
+                        fm.createDirectoryAtPath(parentDir, withIntermediateDirectories = true, attributes = null, error = null)
+                        val fileNsData = entry.data.usePinned { pinned ->
+                            NSData.create(bytes = pinned.addressOf(0), length = entry.data.size.toULong())
+                        }
+                        fm.createFileAtPath(entryFull, contents = fileNsData, attributes = null)
+                    }
+                }
+            }
+            ArchiveFormat.TAR -> {
+                for (entry in ArchiveCodec.tarDecode(archiveData)) {
+                    val entryFull = (targetFull as NSString).stringByAppendingPathComponent(entry.path)
+                    if (entry.isDirectory) {
+                        fm.createDirectoryAtPath(entryFull, withIntermediateDirectories = true, attributes = null, error = null)
+                    } else {
+                        val parentDir = (entryFull as NSString).stringByDeletingLastPathComponent()
+                        fm.createDirectoryAtPath(parentDir, withIntermediateDirectories = true, attributes = null, error = null)
+                        val fileNsData = entry.data.usePinned { pinned ->
+                            NSData.create(bytes = pinned.addressOf(0), length = entry.data.size.toULong())
+                        }
+                        fm.createFileAtPath(entryFull, contents = fileNsData, attributes = null)
+                    }
+                }
+            }
+        }
+    }
+
+    @OptIn(ExperimentalForeignApi::class)
+    override suspend fun listArchive(
+        archivePath: String,
+        format: ArchiveFormat?
+    ): Result<List<ArchiveEntry>> = runCatching {
+        val archiveFull = resolve(archivePath)
+        if (!fm.fileExistsAtPath(archiveFull)) throw FsError.NotFound(archivePath)
+        val handle = NSFileHandle.fileHandleForReadingAtPath(archiveFull)
+            ?: throw FsError.NotFound(archivePath)
+        val nsData = handle.readDataToEndOfFile()
+        handle.closeFile()
+        val archiveData = nsData.toByteArray()
+
+        val resolvedFormat = format ?: ArchiveCodec.detectFormat(archiveData)
+            ?: throw FsError.Unknown("无法检测归档格式")
+
+        when (resolvedFormat) {
+            ArchiveFormat.ZIP -> ArchiveCodec.zipList(archiveData)
+            ArchiveFormat.TAR -> ArchiveCodec.tarList(archiveData)
+        }
+    }
+
+    @OptIn(ExperimentalForeignApi::class)
+    private fun collectArchiveItems(
+        fullPath: String,
+        relativePath: String,
+        items: MutableList<ArchiveCodec.ArchiveItem>
+    ) {
+        if (isDirectory(fullPath)) {
+            val attrs = fm.attributesOfItemAtPath(fullPath, error = null) ?: emptyMap<Any?, Any?>()
+            val modified = (attrs["NSFileModificationDate"] as? platform.Foundation.NSDate)
+                ?.timeIntervalSince1970?.toLong()?.times(1000) ?: 0L
+            items.add(ArchiveCodec.ArchiveItem(relativePath, FsType.DIRECTORY, ByteArray(0), modified))
+            val contents = fm.contentsOfDirectoryAtPath(fullPath, error = null)
+            @Suppress("UNCHECKED_CAST")
+            val names = (contents as? List<String>) ?: emptyList()
+            for (name in names) {
+                val childFull = (fullPath as NSString).stringByAppendingPathComponent(name)
+                val childRel = "$relativePath/$name"
+                collectArchiveItems(childFull, childRel, items)
+            }
+        } else {
+            val attrs = fm.attributesOfItemAtPath(fullPath, error = null) ?: emptyMap<Any?, Any?>()
+            val size = (attrs["NSFileSize"] as? Long) ?: 0L
+            val modified = (attrs["NSFileModificationDate"] as? platform.Foundation.NSDate)
+                ?.timeIntervalSince1970?.toLong()?.times(1000) ?: 0L
+            val handle = NSFileHandle.fileHandleForReadingAtPath(fullPath)
+            val data = if (handle != null) {
+                val nsData = handle.readDataOfLength(size.toULong())
+                handle.closeFile()
+                nsData.toByteArray()
+            } else ByteArray(0)
+            items.add(ArchiveCodec.ArchiveItem(relativePath, FsType.FILE, data, modified))
+        }
     }
 
     // ═══════════════════════════════════════════════════════════

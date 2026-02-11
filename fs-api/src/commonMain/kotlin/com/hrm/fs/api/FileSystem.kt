@@ -210,6 +210,9 @@ interface FileSystem {
 
     /** 符号链接：create / readLink */
     val symlinks: FsSymlinks
+
+    /** 归档压缩：compress / extract / list */
+    val archive: FsArchive
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -371,6 +374,51 @@ interface FsSymlinks {
     suspend fun readLink(path: String): Result<String>
 }
 
+/**
+ * 归档压缩/解压。
+ *
+ * 支持 ZIP 和 TAR 两种格式。ZIP 使用 STORE（无压缩）方式打包，
+ * TAR 为标准 USTAR 格式。所有操作基于虚拟文件系统内的路径。
+ */
+interface FsArchive {
+    /**
+     * 将一组文件/目录打包为归档文件。
+     *
+     * @param sourcePaths 要打包的文件或目录路径列表（目录会递归包含）
+     * @param archivePath 生成的归档文件路径
+     * @param format      归档格式（ZIP 或 TAR）
+     */
+    suspend fun compress(
+        sourcePaths: List<String>,
+        archivePath: String,
+        format: ArchiveFormat = ArchiveFormat.ZIP
+    ): Result<Unit>
+
+    /**
+     * 解压归档文件到指定目录。
+     *
+     * @param archivePath 归档文件路径
+     * @param targetDir   解压目标目录（不存在则自动创建）
+     * @param format      归档格式（ZIP 或 TAR），为 null 时自动检测
+     */
+    suspend fun extract(
+        archivePath: String,
+        targetDir: String,
+        format: ArchiveFormat? = null
+    ): Result<Unit>
+
+    /**
+     * 列出归档文件中的条目（不解压）。
+     *
+     * @param archivePath 归档文件路径
+     * @param format      归档格式，为 null 时自动检测
+     */
+    suspend fun list(
+        archivePath: String,
+        format: ArchiveFormat? = null
+    ): Result<List<ArchiveEntry>>
+}
+
 // ═══════════════════════════════════════════════════════════════
 // 磁盘操作接口
 // ═══════════════════════════════════════════════════════════════
@@ -406,6 +454,48 @@ interface DiskFileOperations {
 
     suspend fun listXattrs(path: String): Result<List<String>> =
         Result.failure(FsError.PermissionDenied("xattr not supported"))
+
+    // ── 归档压缩 / 解压 ──────────────────────────────────────
+
+    /**
+     * 将磁盘上的一组文件/目录压缩为归档文件。
+     *
+     * @param sourcePaths 源路径列表（磁盘相对路径）
+     * @param archivePath 归档文件输出路径（磁盘相对路径）
+     * @param format      归档格式
+     */
+    suspend fun compress(
+        sourcePaths: List<String>,
+        archivePath: String,
+        format: ArchiveFormat
+    ): Result<Unit> =
+        Result.failure(FsError.PermissionDenied("archive not supported"))
+
+    /**
+     * 解压归档文件到指定目录。
+     *
+     * @param archivePath 归档文件路径（磁盘相对路径）
+     * @param targetDir   解压目标目录（磁盘相对路径）
+     * @param format      归档格式，为 null 时自动检测
+     */
+    suspend fun extract(
+        archivePath: String,
+        targetDir: String,
+        format: ArchiveFormat?
+    ): Result<Unit> =
+        Result.failure(FsError.PermissionDenied("archive not supported"))
+
+    /**
+     * 列出归档文件中的条目（不解压）。
+     *
+     * @param archivePath 归档文件路径（磁盘相对路径）
+     * @param format      归档格式，为 null 时自动检测
+     */
+    suspend fun listArchive(
+        archivePath: String,
+        format: ArchiveFormat?
+    ): Result<List<ArchiveEntry>> =
+        Result.failure(FsError.PermissionDenied("archive not supported"))
 }
 
 /**
@@ -493,6 +583,23 @@ data class SearchResult(
 data class MatchedLine(
     val lineNumber: Int,
     val content: String
+)
+
+/** 归档格式。 */
+enum class ArchiveFormat { ZIP, TAR }
+
+/**
+ * 归档文件中的条目信息。
+ */
+data class ArchiveEntry(
+    /** 条目在归档内的相对路径。 */
+    val path: String,
+    /** 条目类型（文件或目录）。 */
+    val type: FsType,
+    /** 文件大小（字节），目录为 0。 */
+    val size: Long,
+    /** 最后修改时间（毫秒时间戳），不可用时为 0。 */
+    val modifiedAtMillis: Long = 0
 )
 
 // ═══════════════════════════════════════════════════════════════

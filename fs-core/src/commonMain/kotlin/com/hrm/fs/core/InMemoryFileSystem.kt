@@ -1,11 +1,15 @@
 package com.hrm.fs.core
 
+import com.hrm.fs.api.ArchiveCodec
+import com.hrm.fs.api.ArchiveEntry
+import com.hrm.fs.api.ArchiveFormat
 import com.hrm.fs.api.ChecksumAlgorithm
 import com.hrm.fs.api.DiskFileOperations
 import com.hrm.fs.api.DiskFileWatcher
 import com.hrm.fs.api.FileHandle
 import com.hrm.fs.api.FileSystem
 import com.hrm.fs.api.FileVersion
+import com.hrm.fs.api.FsArchive
 import com.hrm.fs.api.FsChecksum
 import com.hrm.fs.api.FsEntry
 import com.hrm.fs.api.FsError
@@ -100,6 +104,7 @@ internal class InMemoryFileSystem(
     override val checksum: FsChecksum = ChecksumImpl()
     override val xattr: FsXattr = XattrImpl()
     override val symlinks: FsSymlinks = SymlinksImpl()
+    override val archive: FsArchive = ArchiveImpl()
 
     // ═══════════════════════════════════════════════════════════
     // 基础 CRUD
@@ -902,6 +907,178 @@ internal class InMemoryFileSystem(
                 ensureLoaded()
                 val normalized = PathUtils.normalize(path)
                 tree.readLink(normalized)
+            }
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // ArchiveImpl
+    // ═══════════════════════════════════════════════════════════
+
+    private inner class ArchiveImpl : FsArchive {
+        override suspend fun compress(
+            sourcePaths: List<String>,
+            archivePath: String,
+            format: ArchiveFormat
+        ): Result<Unit> {
+            FLog.d(TAG, "archive.compress: sources=$sourcePaths, archive=$archivePath, format=$format")
+            return try {
+                val normalizedArchive = PathUtils.normalize(archivePath)
+                // 挂载点委托：若归档目标和所有源路径都在同一挂载点下，委托给 diskOps
+                val archiveMatch = locked { mountTable.findMount(normalizedArchive) }
+                if (archiveMatch != null) {
+                    val allInSameMount = sourcePaths.all { src ->
+                        val n = PathUtils.normalize(src)
+                        val m = mountTable.findMount(n)
+                        m != null && m.mountPoint == archiveMatch.mountPoint
+                    }
+                    if (allInSameMount) {
+                        val diskSources = sourcePaths.map { src ->
+                            val n = PathUtils.normalize(src)
+                            mountTable.findMount(n)!!.relativePath
+                        }
+                        return archiveMatch.diskOps.compress(diskSources, archiveMatch.relativePath, format)
+                    }
+                }
+                val items = mutableListOf<ArchiveCodec.ArchiveItem>()
+                for (srcPath in sourcePaths) {
+                    val normalized = PathUtils.normalize(srcPath)
+                    collectItems(normalized, "", items)
+                }
+                val archiveData = when (format) {
+                    ArchiveFormat.ZIP -> ArchiveCodec.zipEncode(items)
+                    ArchiveFormat.TAR -> ArchiveCodec.tarEncode(items)
+                }
+                writeAll(normalizedArchive, archiveData)
+            } catch (e: Exception) {
+                FLog.e(TAG, "archive.compress failed", e)
+                Result.failure(FsError.Unknown("归档失败: ${e.message}"))
+            }
+        }
+
+        override suspend fun extract(
+            archivePath: String,
+            targetDir: String,
+            format: ArchiveFormat?
+        ): Result<Unit> {
+            FLog.d(TAG, "archive.extract: archive=$archivePath, targetDir=$targetDir, format=$format")
+            return try {
+                val normalizedArchive = PathUtils.normalize(archivePath)
+                val normalizedTarget = PathUtils.normalize(targetDir)
+                // 挂载点委托：若归档和目标都在同一挂载点下
+                val archiveMatch = locked { mountTable.findMount(normalizedArchive) }
+                val targetMatch = locked { mountTable.findMount(normalizedTarget) }
+                if (archiveMatch != null && targetMatch != null &&
+                    archiveMatch.mountPoint == targetMatch.mountPoint) {
+                    return archiveMatch.diskOps.extract(archiveMatch.relativePath, targetMatch.relativePath, format)
+                }
+                val archiveData = readAll(normalizedArchive).getOrElse { return Result.failure(it) }
+                val resolvedFormat = format ?: ArchiveCodec.detectFormat(archiveData)
+                    ?: return Result.failure(FsError.Unknown("无法检测归档格式"))
+                createDirRecursive(normalizedTarget).getOrElse { return Result.failure(it) }
+
+                when (resolvedFormat) {
+                    ArchiveFormat.ZIP -> {
+                        for (entry in ArchiveCodec.zipDecode(archiveData)) {
+                            val path = "$normalizedTarget/${entry.path}"
+                            if (entry.isDirectory) {
+                                createDirRecursive(path).getOrElse { return Result.failure(it) }
+                            } else {
+                                writeAll(path, entry.data).getOrElse { return Result.failure(it) }
+                            }
+                        }
+                    }
+                    ArchiveFormat.TAR -> {
+                        for (entry in ArchiveCodec.tarDecode(archiveData)) {
+                            val path = "$normalizedTarget/${entry.path}"
+                            if (entry.isDirectory) {
+                                createDirRecursive(path).getOrElse { return Result.failure(it) }
+                            } else {
+                                writeAll(path, entry.data).getOrElse { return Result.failure(it) }
+                            }
+                        }
+                    }
+                }
+                FLog.d(TAG, "archive.extract success")
+                Result.success(Unit)
+            } catch (e: Exception) {
+                FLog.e(TAG, "archive.extract failed", e)
+                Result.failure(FsError.Unknown("解压失败: ${e.message}"))
+            }
+        }
+
+        override suspend fun list(
+            archivePath: String,
+            format: ArchiveFormat?
+        ): Result<List<ArchiveEntry>> {
+            FLog.d(TAG, "archive.list: archive=$archivePath, format=$format")
+            return try {
+                val normalized = PathUtils.normalize(archivePath)
+                // 挂载点委托
+                val match = locked { mountTable.findMount(normalized) }
+                if (match != null) {
+                    return match.diskOps.listArchive(match.relativePath, format)
+                }
+                val archiveData = readAll(normalized).getOrElse { return Result.failure(it) }
+                val resolvedFormat = format ?: ArchiveCodec.detectFormat(archiveData)
+                    ?: return Result.failure(FsError.Unknown("无法检测归档格式"))
+                val entries = when (resolvedFormat) {
+                    ArchiveFormat.ZIP -> ArchiveCodec.zipList(archiveData)
+                    ArchiveFormat.TAR -> ArchiveCodec.tarList(archiveData)
+                }
+                Result.success(entries)
+            } catch (e: Exception) {
+                FLog.e(TAG, "archive.list failed", e)
+                Result.failure(FsError.Unknown("列出归档内容失败: ${e.message}"))
+            }
+        }
+
+        private suspend fun collectItems(
+            fsPath: String,
+            relativePath: String,
+            items: MutableList<ArchiveCodec.ArchiveItem>
+        ) {
+            val meta = stat(fsPath).getOrThrow()
+            val entryPath = if (relativePath.isEmpty()) fsPath.substringAfterLast('/') else relativePath
+            when (meta.type) {
+                FsType.FILE -> {
+                    val data = readAll(fsPath).getOrThrow()
+                    items.add(
+                        ArchiveCodec.ArchiveItem(
+                            path = entryPath,
+                            type = FsType.FILE,
+                            data = data,
+                            modifiedAtMillis = meta.modifiedAtMillis
+                        )
+                    )
+                }
+                FsType.DIRECTORY -> {
+                    items.add(
+                        ArchiveCodec.ArchiveItem(
+                            path = entryPath,
+                            type = FsType.DIRECTORY,
+                            data = ByteArray(0),
+                            modifiedAtMillis = meta.modifiedAtMillis
+                        )
+                    )
+                    val children = readDir(fsPath).getOrThrow()
+                    for (child in children) {
+                        val childFsPath = "$fsPath/${child.name}"
+                        val childRelPath = "$entryPath/${child.name}"
+                        collectItems(childFsPath, childRelPath, items)
+                    }
+                }
+                FsType.SYMLINK -> {
+                    val data = readAll(fsPath).getOrElse { ByteArray(0) }
+                    items.add(
+                        ArchiveCodec.ArchiveItem(
+                            path = entryPath,
+                            type = FsType.FILE,
+                            data = data,
+                            modifiedAtMillis = meta.modifiedAtMillis
+                        )
+                    )
+                }
             }
         }
     }

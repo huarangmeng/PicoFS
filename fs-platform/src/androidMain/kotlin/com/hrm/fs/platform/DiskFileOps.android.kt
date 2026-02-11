@@ -1,6 +1,8 @@
 package com.hrm.fs.platform
 
 import android.os.Build
+import com.hrm.fs.api.ArchiveEntry
+import com.hrm.fs.api.ArchiveFormat
 import com.hrm.fs.api.DiskFileEvent
 import com.hrm.fs.api.DiskFileOperations
 import com.hrm.fs.api.DiskFileWatcher
@@ -239,6 +241,307 @@ internal class AndroidDiskFileOperations(override val rootPath: String) : DiskFi
                 view.list()
             }
         }
+
+    // ═══════════════════════════════════════════════════════════
+    // archive — 基于 java.util.zip
+    // ═══════════════════════════════════════════════════════════
+
+    override suspend fun compress(
+        sourcePaths: List<String>,
+        archivePath: String,
+        format: ArchiveFormat
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val archiveFile = resolve(archivePath)
+            archiveFile.parentFile?.mkdirs()
+            when (format) {
+                ArchiveFormat.ZIP -> zipCompress(sourcePaths, archiveFile)
+                ArchiveFormat.TAR -> tarCompress(sourcePaths, archiveFile)
+            }
+        }
+    }
+
+    override suspend fun extract(
+        archivePath: String,
+        targetDir: String,
+        format: ArchiveFormat?
+    ): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val archiveFile = resolve(archivePath)
+            if (!archiveFile.exists()) throw FsError.NotFound(archivePath)
+            val targetFile = resolve(targetDir)
+            targetFile.mkdirs()
+            val resolvedFormat = format ?: detectFormat(archiveFile)
+                ?: throw FsError.Unknown("无法检测归档格式: $archivePath")
+            when (resolvedFormat) {
+                ArchiveFormat.ZIP -> zipExtract(archiveFile, targetFile)
+                ArchiveFormat.TAR -> tarExtract(archiveFile, targetFile)
+            }
+        }
+    }
+
+    override suspend fun listArchive(
+        archivePath: String,
+        format: ArchiveFormat?
+    ): Result<List<ArchiveEntry>> = withContext(Dispatchers.IO) {
+        runCatching {
+            val archiveFile = resolve(archivePath)
+            if (!archiveFile.exists()) throw FsError.NotFound(archivePath)
+            val resolvedFormat = format ?: detectFormat(archiveFile)
+                ?: throw FsError.Unknown("无法检测归档格式: $archivePath")
+            when (resolvedFormat) {
+                ArchiveFormat.ZIP -> zipList(archiveFile)
+                ArchiveFormat.TAR -> tarList(archiveFile)
+            }
+        }
+    }
+
+    private fun detectFormat(file: File): ArchiveFormat? {
+        if (!file.exists() || file.length() < 4) return null
+        val header = ByteArray(264)
+        file.inputStream().use { it.read(header) }
+        if (header[0] == 0x50.toByte() && header[1] == 0x4B.toByte() &&
+            header[2] == 0x03.toByte() && header[3] == 0x04.toByte()
+        ) return ArchiveFormat.ZIP
+        if (header.size >= 263) {
+            val ustar = "ustar"
+            if ((0 until 5).all { header[257 + it] == ustar[it].code.toByte() }) return ArchiveFormat.TAR
+        }
+        return null
+    }
+
+    // ── ZIP ──────────────────────────────────────────────────
+
+    private fun zipCompress(sourcePaths: List<String>, archiveFile: File) {
+        java.util.zip.ZipOutputStream(archiveFile.outputStream().buffered()).use { zos ->
+            for (srcPath in sourcePaths) {
+                val srcFile = resolve(srcPath)
+                if (!srcFile.exists()) throw FsError.NotFound(srcPath)
+                val baseName = srcFile.name
+                if (srcFile.isDirectory) {
+                    zipAddDirectory(zos, srcFile, baseName)
+                } else {
+                    zipAddFile(zos, srcFile, baseName)
+                }
+            }
+        }
+    }
+
+    private fun zipAddDirectory(zos: java.util.zip.ZipOutputStream, dir: File, prefix: String) {
+        val entry = java.util.zip.ZipEntry("$prefix/")
+        entry.time = dir.lastModified()
+        zos.putNextEntry(entry)
+        zos.closeEntry()
+        dir.listFiles()?.forEach { child ->
+            val childName = "$prefix/${child.name}"
+            if (child.isDirectory) {
+                zipAddDirectory(zos, child, childName)
+            } else {
+                zipAddFile(zos, child, childName)
+            }
+        }
+    }
+
+    private fun zipAddFile(zos: java.util.zip.ZipOutputStream, file: File, name: String) {
+        val entry = java.util.zip.ZipEntry(name)
+        entry.time = file.lastModified()
+        zos.putNextEntry(entry)
+        file.inputStream().use { it.copyTo(zos) }
+        zos.closeEntry()
+    }
+
+    private fun zipExtract(archiveFile: File, targetDir: File) {
+        java.util.zip.ZipInputStream(archiveFile.inputStream().buffered()).use { zis ->
+            var entry = zis.nextEntry
+            while (entry != null) {
+                val outFile = File(targetDir, entry.name)
+                if (entry.isDirectory) {
+                    outFile.mkdirs()
+                } else {
+                    outFile.parentFile?.mkdirs()
+                    outFile.outputStream().use { zis.copyTo(it) }
+                    if (entry.time > 0) outFile.setLastModified(entry.time)
+                }
+                zis.closeEntry()
+                entry = zis.nextEntry
+            }
+        }
+    }
+
+    private fun zipList(archiveFile: File): List<ArchiveEntry> {
+        val entries = mutableListOf<ArchiveEntry>()
+        java.util.zip.ZipInputStream(archiveFile.inputStream().buffered()).use { zis ->
+            var entry = zis.nextEntry
+            while (entry != null) {
+                val path = entry.name.trimEnd('/')
+                entries.add(
+                    ArchiveEntry(
+                        path = path,
+                        type = if (entry.isDirectory) FsType.DIRECTORY else FsType.FILE,
+                        size = if (entry.isDirectory) 0L else entry.size.coerceAtLeast(0),
+                        modifiedAtMillis = entry.time.coerceAtLeast(0)
+                    )
+                )
+                zis.closeEntry()
+                entry = zis.nextEntry
+            }
+        }
+        return entries
+    }
+
+    // ── TAR (USTAR) ─────────────────────────────────────────
+
+    private fun tarCompress(sourcePaths: List<String>, archiveFile: File) {
+        archiveFile.outputStream().buffered().use { out ->
+            for (srcPath in sourcePaths) {
+                val srcFile = resolve(srcPath)
+                if (!srcFile.exists()) throw FsError.NotFound(srcPath)
+                tarAddEntry(out, srcFile, srcFile.name)
+            }
+            out.write(ByteArray(1024))
+        }
+    }
+
+    private fun tarAddEntry(out: java.io.OutputStream, file: File, name: String) {
+        if (file.isDirectory) {
+            out.write(buildTarHeader("$name/", 0, file.lastModified(), isDir = true))
+            file.listFiles()?.forEach { child ->
+                tarAddEntry(out, child, "$name/${child.name}")
+            }
+        } else {
+            val size = file.length()
+            out.write(buildTarHeader(name, size, file.lastModified(), isDir = false))
+            file.inputStream().use { it.copyTo(out) }
+            val remainder = (size % 512).toInt()
+            if (remainder != 0) out.write(ByteArray(512 - remainder))
+        }
+    }
+
+    private fun buildTarHeader(name: String, size: Long, mtime: Long, isDir: Boolean): ByteArray {
+        val header = ByteArray(512)
+        val nameBytes = name.encodeToByteArray()
+        nameBytes.copyInto(header, 0, 0, minOf(nameBytes.size, 100))
+        writeOctal(header, 100, 8, if (isDir) 493 else 420)
+        writeOctal(header, 108, 8, 0)
+        writeOctal(header, 116, 8, 0)
+        writeOctal(header, 124, 12, size)
+        writeOctal(header, 136, 12, mtime / 1000)
+        for (i in 148 until 156) header[i] = ' '.code.toByte()
+        header[156] = if (isDir) '5'.code.toByte() else '0'.code.toByte()
+        val ustar = "ustar\u000000"
+        ustar.encodeToByteArray().copyInto(header, 257, 0, minOf(ustar.length, 8))
+        var chksum = 0
+        for (b in header) chksum += (b.toInt() and 0xFF)
+        writeOctal(header, 148, 7, chksum.toLong())
+        header[155] = ' '.code.toByte()
+        return header
+    }
+
+    private fun tarExtract(archiveFile: File, targetDir: File) {
+        archiveFile.inputStream().buffered().use { input ->
+            val headerBuf = ByteArray(512)
+            while (true) {
+                val read = readFully(input, headerBuf)
+                if (read < 512) break
+                if (headerBuf.all { it == 0.toByte() }) break
+
+                val name = readTarString(headerBuf, 0, 100)
+                val sizeOctal = readTarString(headerBuf, 124, 12)
+                val mtimeOctal = readTarString(headerBuf, 136, 12)
+                val typeFlag = headerBuf[156]
+                val size = parseOctal(sizeOctal)
+                val mtime = parseOctal(mtimeOctal) * 1000
+                val isDir = typeFlag == '5'.code.toByte() || name.endsWith("/")
+
+                val outFile = File(targetDir, name.trimEnd('/'))
+                if (isDir) {
+                    outFile.mkdirs()
+                } else {
+                    outFile.parentFile?.mkdirs()
+                    outFile.outputStream().use { out ->
+                        var remaining = size
+                        val buf = ByteArray(8192)
+                        while (remaining > 0) {
+                            val toRead = minOf(remaining.toInt(), buf.size)
+                            val n = input.read(buf, 0, toRead)
+                            if (n <= 0) break
+                            out.write(buf, 0, n)
+                            remaining -= n
+                        }
+                    }
+                    val remainder = (size % 512).toInt()
+                    if (remainder != 0) input.skip((512 - remainder).toLong())
+                    if (mtime > 0) outFile.setLastModified(mtime)
+                }
+            }
+        }
+    }
+
+    private fun tarList(archiveFile: File): List<ArchiveEntry> {
+        val entries = mutableListOf<ArchiveEntry>()
+        archiveFile.inputStream().buffered().use { input ->
+            val headerBuf = ByteArray(512)
+            while (true) {
+                val read = readFully(input, headerBuf)
+                if (read < 512) break
+                if (headerBuf.all { it == 0.toByte() }) break
+
+                val name = readTarString(headerBuf, 0, 100)
+                val sizeOctal = readTarString(headerBuf, 124, 12)
+                val mtimeOctal = readTarString(headerBuf, 136, 12)
+                val typeFlag = headerBuf[156]
+                val size = parseOctal(sizeOctal)
+                val mtime = parseOctal(mtimeOctal) * 1000
+                val isDir = typeFlag == '5'.code.toByte() || name.endsWith("/")
+
+                entries.add(
+                    ArchiveEntry(
+                        path = name.trimEnd('/'),
+                        type = if (isDir) FsType.DIRECTORY else FsType.FILE,
+                        size = if (isDir) 0L else size,
+                        modifiedAtMillis = mtime
+                    )
+                )
+                if (size > 0 && !isDir) {
+                    val skip = size + ((512 - (size % 512)) % 512)
+                    input.skip(skip)
+                }
+            }
+        }
+        return entries
+    }
+
+    private fun readFully(input: java.io.InputStream, buf: ByteArray): Int {
+        var offset = 0
+        while (offset < buf.size) {
+            val n = input.read(buf, offset, buf.size - offset)
+            if (n <= 0) break
+            offset += n
+        }
+        return offset
+    }
+
+    private fun readTarString(data: ByteArray, offset: Int, maxLen: Int): String {
+        var end = offset
+        val limit = minOf(offset + maxLen, data.size)
+        while (end < limit && data[end] != 0.toByte()) end++
+        return data.decodeToString(offset, end)
+    }
+
+    private fun parseOctal(s: String): Long {
+        val trimmed = s.trim().trimEnd('\u0000')
+        if (trimmed.isEmpty()) return 0
+        return trimmed.toLongOrNull(8) ?: 0
+    }
+
+    private fun writeOctal(header: ByteArray, offset: Int, fieldLen: Int, value: Long) {
+        val octalStr = value.toString(8)
+        val padded = octalStr.padStart(fieldLen - 1, '0')
+        val bytes = padded.encodeToByteArray()
+        val copyLen = minOf(bytes.size, fieldLen - 1)
+        bytes.copyInto(header, offset, bytes.size - copyLen, bytes.size)
+        header[offset + fieldLen - 1] = 0
+    }
 
     // ═══════════════════════════════════════════════════════════
     // DiskFileWatcher — 根据 API level 选择实现策略

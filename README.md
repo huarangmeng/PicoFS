@@ -8,7 +8,7 @@
 
 ### 架构分层
 
-- **`fs-api`**：对外接口与模型（`FileSystem`、`FileHandle`、`FsMeta` 等）。
+- **`fs-api`**：对外接口与模型（`FileSystem`、`FileHandle`、`FsMeta`、`ArchiveCodec` 等）。
 - **`fs-core`**：VFS 核心逻辑（目录树、元数据、读写与路径规范化）。
 - **`fs-platform`**：平台差异适配（平台识别、能力提示；后续可扩展沙箱路径策略）。
 
@@ -74,7 +74,7 @@
   - **✅ 文件锁**（flock，文件级并发控制，共享锁/独占锁/锁升级/挂起等待）
   - **✅ 搜索 / 查找**（按文件名/内容搜索，类 find/grep，支持 glob 通配符、内容 grep、类型过滤、深度限制、大小写控制，跨内存与挂载点统一搜索）
   - **✅ 文件扩展属性**（xattr / 自定义标签，set/get/remove/list，支持文件/目录/符号链接，WAL + Snapshot 持久化）
-  - **⬜ 压缩 / 解压**（zip/tar 归档操作）
+  - **✅ 压缩 / 解压**（ZIP/TAR 归档操作，compress/extract/list，支持自动格式检测，VFS 内存文件与挂载点统一操作，三端真实文件系统 JVM/Android/iOS 均支持）
   - **✅ 文件哈希 / 校验**（纯 Kotlin 实现 CRC32/SHA-256，`checksum()` API 支持内存文件与挂载点文件）
   - **⬜ 回收站**（软删除 + 恢复机制）
   - **✅ 版本历史**（写入自动保存历史版本，`fileVersions()`/`readVersion()`/`restoreVersion()` API，支持内存文件与挂载点文件，独立持久化）
@@ -96,10 +96,6 @@ interface FileSystem {
     suspend fun createDirRecursive(path: String): Result<Unit>
     suspend fun deleteRecursive(path: String): Result<Unit>
 
-    // 符号链接
-    suspend fun createSymlink(linkPath: String, targetPath: String): Result<Unit>
-    suspend fun readLink(path: String): Result<String>
-
     // 便捷读写
     suspend fun readAll(path: String): Result<ByteArray>
     suspend fun writeAll(path: String, data: ByteArray): Result<Unit>
@@ -109,49 +105,21 @@ interface FileSystem {
     suspend fun move(srcPath: String, dstPath: String): Result<Unit>
     suspend fun rename(srcPath: String, dstPath: String): Result<Unit>
 
-    // 挂载
-    suspend fun mount(virtualPath: String, diskOps: DiskFileOperations, options: MountOptions = MountOptions()): Result<Unit>
-    suspend fun unmount(virtualPath: String): Result<Unit>
-    suspend fun listMounts(): List<String>
-    suspend fun pendingMounts(): List<PendingMount>
+    // ─── 扩展能力（子接口） ─────────────────────────────────
 
-    // 同步
-    suspend fun sync(path: String): Result<List<FsEvent>>
-
-    // 监听
-    fun watch(path: String): Flow<FsEvent>
-
-    // 流式读写
-    fun readStream(path: String, chunkSize: Int = 8192): Flow<ByteArray>
-    suspend fun writeStream(path: String, dataFlow: Flow<ByteArray>): Result<Unit>
-
-    // 可观测性
-    fun metrics(): FsMetrics
-    fun resetMetrics()
-
-    // 配额
-    fun quotaInfo(): QuotaInfo
-
-    // 文件哈希
-    suspend fun checksum(path: String, algorithm: ChecksumAlgorithm = ChecksumAlgorithm.SHA256): Result<String>
-
-    // 版本历史
-    suspend fun fileVersions(path: String): Result<List<FileVersion>>
-    suspend fun readVersion(path: String, versionId: String): Result<ByteArray>
-    suspend fun restoreVersion(path: String, versionId: String): Result<Unit>
-
-    // 搜索 / 查找
-    suspend fun find(query: SearchQuery): Result<List<SearchResult>>
-
-    // 扩展属性（xattr）
-    suspend fun setXattr(path: String, name: String, value: ByteArray): Result<Unit>
-    suspend fun getXattr(path: String, name: String): Result<ByteArray>
-    suspend fun removeXattr(path: String, name: String): Result<Unit>
-    suspend fun listXattrs(path: String): Result<List<String>>
+    val mounts: FsMounts         // mount / unmount / sync / list / pending
+    val versions: FsVersions     // list / read / restore
+    val search: FsSearch         // find（glob + grep）
+    val observe: FsObserve       // watch / metrics / resetMetrics / quotaInfo
+    val streams: FsStreams       // read / write（Flow 分块流式 IO）
+    val checksum: FsChecksum     // compute（CRC32 / SHA-256）
+    val xattr: FsXattr           // set / get / remove / list
+    val symlinks: FsSymlinks     // create / readLink
+    val archive: FsArchive       // compress / extract / list（ZIP / TAR）
 }
 ```
 
-> 说明：该接口在 `commonMain` 中定义，平台侧通过 `expect/actual` 提供沙箱路径与能力适配；`FsMeta` 含权限信息。
+> 说明：该接口在 `commonMain` 中定义，基础 CRUD 直接在 `FileSystem` 上调用，扩展能力通过 9 个子接口属性访问（如 `fs.mounts.mount(...)`、`fs.archive.compress(...)`）。平台侧通过 `expect/actual` 提供沙箱路径与能力适配。
 
 ### 平台实现思路（VFS）
 
