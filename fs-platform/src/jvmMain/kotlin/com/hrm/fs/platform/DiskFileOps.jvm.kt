@@ -33,6 +33,7 @@ import java.nio.file.WatchService
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.TimeUnit
 
+
 actual fun createDiskFileOperations(rootPath: String): DiskFileOperations = JvmDiskFileOperations(rootPath)
 
 internal class JvmDiskFileOperations(override val rootPath: String) : DiskFileOperations, DiskFileWatcher {
@@ -156,75 +157,9 @@ internal class JvmDiskFileOperations(override val rootPath: String) : DiskFileOp
     }
 
     // ═══════════════════════════════════════════════════════════
-    // xattr — 基于 UserDefinedFileAttributeView
+    // xattr — 由 InMemoryFileSystem 的 mountXattrs overlay 处理，
+    // 平台层使用接口默认实现（返回 not supported）。
     // ═══════════════════════════════════════════════════════════
-
-    override suspend fun setXattr(path: String, name: String, value: ByteArray): Result<Unit> =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                val file = resolve(path)
-                if (!file.exists()) throw FsError.NotFound(path)
-                val view = Files.getFileAttributeView(
-                    file.toPath(),
-                    java.nio.file.attribute.UserDefinedFileAttributeView::class.java
-                ) ?: throw FsError.PermissionDenied("xattr not supported on this filesystem: $path")
-                view.write(name, java.nio.ByteBuffer.wrap(value))
-                Unit
-            }
-        }
-
-    override suspend fun getXattr(path: String, name: String): Result<ByteArray> =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                val file = resolve(path)
-                if (!file.exists()) throw FsError.NotFound(path)
-                val view = Files.getFileAttributeView(
-                    file.toPath(),
-                    java.nio.file.attribute.UserDefinedFileAttributeView::class.java
-                ) ?: throw FsError.PermissionDenied("xattr not supported on this filesystem: $path")
-                val size = try {
-                    view.size(name)
-                } catch (_: Exception) {
-                    throw FsError.NotFound("xattr '$name' on $path")
-                }
-                val buf = java.nio.ByteBuffer.allocate(size)
-                view.read(name, buf)
-                buf.flip()
-                val bytes = ByteArray(buf.remaining())
-                buf.get(bytes)
-                bytes
-            }
-        }
-
-    override suspend fun removeXattr(path: String, name: String): Result<Unit> =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                val file = resolve(path)
-                if (!file.exists()) throw FsError.NotFound(path)
-                val view = Files.getFileAttributeView(
-                    file.toPath(),
-                    java.nio.file.attribute.UserDefinedFileAttributeView::class.java
-                ) ?: throw FsError.PermissionDenied("xattr not supported on this filesystem: $path")
-                try {
-                    view.delete(name)
-                } catch (_: Exception) {
-                    throw FsError.NotFound("xattr '$name' on $path")
-                }
-            }
-        }
-
-    override suspend fun listXattrs(path: String): Result<List<String>> =
-        withContext(Dispatchers.IO) {
-            runCatching {
-                val file = resolve(path)
-                if (!file.exists()) throw FsError.NotFound(path)
-                val view = Files.getFileAttributeView(
-                    file.toPath(),
-                    java.nio.file.attribute.UserDefinedFileAttributeView::class.java
-                ) ?: throw FsError.PermissionDenied("xattr not supported on this filesystem: $path")
-                view.list()
-            }
-        }
 
     // ═══════════════════════════════════════════════════════════
     // archive — 基于 java.util.zip

@@ -93,6 +93,12 @@ internal class InMemoryFileSystem(
     internal val statCache = VfsCache<String, FsMeta>(256)
     internal val readDirCache = VfsCache<String, List<FsEntry>>(128)
 
+    /** 挂载点文件的 xattr overlay（挂载点路径 -> name -> value） */
+    internal val mountXattrs = LinkedHashMap<String, MutableMap<String, ByteArray>>()
+
+    /** 快照后 xattr overlay 中被修改过的路径（脏标记），仅这些需要重新写入 WAL */
+    private val dirtyXattrPaths = mutableSetOf<String>()
+
     internal val watchScope = watcherScope ?: CoroutineScope(SupervisorJob())
     internal val watcherJobs = LinkedHashMap<String, Job>()
 
@@ -889,11 +895,42 @@ internal class InMemoryFileSystem(
     // ═══════════════════════════════════════════════════════════
 
     private inner class XattrImpl : FsXattr {
+        /**
+         * 挂载点 xattr 策略：
+         *   1. 先探测平台 diskOps 是否支持原生 xattr（结果缓存）
+         *   2. 支持原生 → 直接调用 diskOps（iOS POSIX xattr）
+         *   3. 不支持 → fallback 到内存 overlay + WAL 持久化（JVM/Android）
+         */
+
+        /** 缓存 diskOps 实例是否支持原生 xattr：null=未探测，true=支持，false=不支持 */
+        private val nativeXattrSupport = HashMap<DiskFileOperations, Boolean>()
+
+        /** 探测 diskOps 是否支持原生 xattr（首次调用时触发，结果缓存）。 */
+        private suspend fun supportsNativeXattr(diskOps: DiskFileOperations, testPath: String): Boolean {
+            nativeXattrSupport[diskOps]?.let { return it }
+            // 用一次 listXattrs 探测：如果返回 PermissionDenied("xattr not supported") 则不支持
+            val probeResult = diskOps.listXattrs(testPath)
+            val supported = probeResult.isSuccess ||
+                probeResult.exceptionOrNull() !is FsError.PermissionDenied
+            nativeXattrSupport[diskOps] = supported
+            return supported
+        }
+
         override suspend fun set(path: String, name: String, value: ByteArray): Result<Unit> = locked {
             ensureLoaded()
             val normalized = PathUtils.normalize(path)
             val match = mountTable.findMount(normalized)
-            if (match != null) return@locked match.diskOps.setXattr(match.relativePath, name, value)
+            if (match != null) {
+                match.diskOps.stat(match.relativePath).getOrElse { return@locked Result.failure(it) }
+                if (supportsNativeXattr(match.diskOps, match.relativePath)) {
+                    return@locked match.diskOps.setXattr(match.relativePath, name, value)
+                }
+                // fallback: overlay + WAL
+                mountXattrs.getOrPut(normalized) { LinkedHashMap() }[name] = value.copyOf()
+                dirtyXattrPaths.add(normalized)
+                walAppend(WalEntry.SetXattr(normalized, name, value))
+                return@locked Result.success(Unit)
+            }
             tree.setXattr(normalized, name, value).also { r ->
                 if (r.isSuccess) walAppend(WalEntry.SetXattr(normalized, name, value))
             }
@@ -903,7 +940,16 @@ internal class InMemoryFileSystem(
             ensureLoaded()
             val normalized = PathUtils.normalize(path)
             val match = mountTable.findMount(normalized)
-            if (match != null) return@locked match.diskOps.getXattr(match.relativePath, name)
+            if (match != null) {
+                if (supportsNativeXattr(match.diskOps, match.relativePath)) {
+                    return@locked match.diskOps.getXattr(match.relativePath, name)
+                }
+                // fallback: overlay
+                val attrs = mountXattrs[normalized]
+                val value = attrs?.get(name)
+                    ?: return@locked Result.failure(FsError.NotFound("xattr '$name' on $normalized"))
+                return@locked Result.success(value.copyOf())
+            }
             tree.getXattr(normalized, name)
         }
 
@@ -911,7 +957,20 @@ internal class InMemoryFileSystem(
             ensureLoaded()
             val normalized = PathUtils.normalize(path)
             val match = mountTable.findMount(normalized)
-            if (match != null) return@locked match.diskOps.removeXattr(match.relativePath, name)
+            if (match != null) {
+                if (supportsNativeXattr(match.diskOps, match.relativePath)) {
+                    return@locked match.diskOps.removeXattr(match.relativePath, name)
+                }
+                // fallback: overlay + WAL
+                val attrs = mountXattrs[normalized]
+                if (attrs == null || attrs.remove(name) == null) {
+                    return@locked Result.failure(FsError.NotFound("xattr '$name' on $normalized"))
+                }
+                if (attrs.isEmpty()) mountXattrs.remove(normalized)
+                dirtyXattrPaths.add(normalized)
+                walAppend(WalEntry.RemoveXattr(normalized, name))
+                return@locked Result.success(Unit)
+            }
             tree.removeXattr(normalized, name).also { r ->
                 if (r.isSuccess) walAppend(WalEntry.RemoveXattr(normalized, name))
             }
@@ -921,7 +980,13 @@ internal class InMemoryFileSystem(
             ensureLoaded()
             val normalized = PathUtils.normalize(path)
             val match = mountTable.findMount(normalized)
-            if (match != null) return@locked match.diskOps.listXattrs(match.relativePath)
+            if (match != null) {
+                if (supportsNativeXattr(match.diskOps, match.relativePath)) {
+                    return@locked match.diskOps.listXattrs(match.relativePath)
+                }
+                // fallback: overlay
+                return@locked Result.success(mountXattrs[normalized]?.keys?.toList() ?: emptyList())
+            }
             tree.listXattrs(normalized)
         }
     }
@@ -1450,6 +1515,24 @@ internal class InMemoryFileSystem(
         }
         if (loadResult.walEntries.isNotEmpty()) {
             tree.replayWal(loadResult.walEntries)
+            // 恢复挂载点路径的 xattr overlay
+            for (entry in loadResult.walEntries) {
+                when (entry) {
+                    is WalEntry.SetXattr -> {
+                        if (mountTable.findMount(entry.path) != null) {
+                            mountXattrs.getOrPut(entry.path) { LinkedHashMap() }[entry.name] = entry.value.copyOf()
+                        }
+                    }
+                    is WalEntry.RemoveXattr -> {
+                        if (mountTable.findMount(entry.path) != null) {
+                            val attrs = mountXattrs[entry.path]
+                            attrs?.remove(entry.name)
+                            if (attrs != null && attrs.isEmpty()) mountXattrs.remove(entry.path)
+                        }
+                    }
+                    else -> {}
+                }
+            }
             FLog.d(TAG, "ensureLoaded: replayed ${loadResult.walEntries.size} WAL entries")
         }
         if (loadResult.mountInfos.isNotEmpty()) {
@@ -1471,8 +1554,31 @@ internal class InMemoryFileSystem(
             entry,
             snapshotProvider = { tree.toSnapshot() },
             versionDataProvider = { versionManager.toSnapshotData() },
-            trashDataProvider = { SnapshotTrashData(trashManager.toSnapshotEntries()) }
+            trashDataProvider = { SnapshotTrashData(trashManager.toSnapshotEntries()) },
+            postSnapshotWalEntries = { mountXattrsToWalEntries() }
         )
+    }
+
+    /**
+     * 将 mountXattrs overlay 转为 WAL 条目。
+     *
+     * 快照保存后 WAL 被清空，overlay 条目必须全量重新写入 WAL，
+     * 否则下次恢复时会丢失这些 xattr。
+     *
+     * 优化：如果 overlay 为空或自上次快照以来无 xattr 变更（dirtyXattrPaths 为空），
+     * 且 overlay 中所有条目都已经在上次快照前写入了 WAL，则可以跳过回写。
+     * 但由于快照会清空 WAL，这里始终需要全量回写非空的 overlay。
+     */
+    private fun mountXattrsToWalEntries(): List<WalEntry> {
+        dirtyXattrPaths.clear()
+        if (mountXattrs.isEmpty()) return emptyList()
+        val entries = mutableListOf<WalEntry>()
+        for ((path, attrs) in mountXattrs) {
+            for ((name, value) in attrs) {
+                entries.add(WalEntry.SetXattr(path, name, value))
+            }
+        }
+        return entries
     }
 
     private suspend fun persistTrash() {

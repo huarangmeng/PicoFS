@@ -20,7 +20,7 @@ import com.hrm.fs.core.persistence.WalEntry
  * ## 崩溃恢复策略
  *
  * 写入顺序保证：
- * - WAL 追加：增量 append 新条目（O(1)），避免全量重写
+ * - WAL 追加：增量 append 新条目（O(1)），每条独立 CRC 校验
  * - Snapshot 保存：原子写（先写临时 key → 读回校验 CRC → 替换正式 key → 删临时 key）
  *   即使在写入 snapshot 后、清空 WAL 前崩溃，下次恢复时会重放 WAL（幂等）
  *
@@ -78,13 +78,12 @@ internal class VfsPersistenceManager(
         // ── 读取 WAL（容错） ──
         val wal = try {
             storage.read(config.walKey).getOrNull()?.let {
-                VfsPersistenceCodec.decodeWal(it)
+                VfsPersistenceCodec.decodeWalLines(it)
             }.orEmpty()
         } catch (e: CorruptedDataException) {
             val msg = "WAL corrupted (CRC mismatch), skipping WAL replay: ${e.message}"
             FLog.w(TAG, msg)
             warnings.add(msg)
-            // WAL 损坏时清除损坏的 WAL 文件，防止下次加载再次失败
             try {
                 storage.delete(config.walKey)
             } catch (_: Exception) { }
@@ -195,11 +194,10 @@ internal class VfsPersistenceManager(
     // ── WAL ──────────────────────────────────────────────────
 
     /**
-     * 追加一条 WAL 条目并持久化。
+     * 追加一条 WAL 条目并持久化（增量追加 O(1)）。
      * 达到阈值时自动触发快照。
      *
-     * 增量追加：仅重写 WAL，每次编码当前完整 walEntries 列表。
-     * （WAL 条目通常 < 20 条，因为达到 autoSnapshotEvery 时会快照并清空 WAL。）
+     * 新 WAL 格式：每行一条 "CRC:<hex8>\t<json>\n"，追加时只编码并 append 新条目。
      *
      * @param snapshotProvider 生成当前快照的回调（惰性，仅在需要快照时调用）
      * @param versionDataProvider 生成版本数据的回调（惰性）
@@ -208,16 +206,20 @@ internal class VfsPersistenceManager(
         entry: WalEntry,
         snapshotProvider: () -> SnapshotNode,
         versionDataProvider: () -> SnapshotVersionData,
-        trashDataProvider: () -> SnapshotTrashData
+        trashDataProvider: () -> SnapshotTrashData,
+        postSnapshotWalEntries: (() -> List<WalEntry>)? = null
     ) {
         if (storage == null) return
         walEntries.add(entry)
         opsSinceSnapshot++
-        storage.write(config.walKey, VfsPersistenceCodec.encodeWal(walEntries))
+        // 增量追加：读取已有 WAL 数据，拼接新条目
+        val existing = storage.read(config.walKey).getOrNull() ?: ByteArray(0)
+        val newEntryBytes = VfsPersistenceCodec.encodeWalEntry(entry)
+        storage.write(config.walKey, existing + newEntryBytes)
         FLog.v(TAG, "appendWal: opsSinceSnapshot=$opsSinceSnapshot, entry=$entry")
         if (opsSinceSnapshot >= config.autoSnapshotEvery) {
             FLog.d(TAG, "appendWal: auto snapshot triggered at $opsSinceSnapshot ops")
-            saveSnapshot(snapshotProvider(), versionDataProvider(), trashDataProvider())
+            saveSnapshot(snapshotProvider(), versionDataProvider(), trashDataProvider(), postSnapshotWalEntries)
         }
     }
 
@@ -237,7 +239,8 @@ internal class VfsPersistenceManager(
     suspend fun saveSnapshot(
         snapshot: SnapshotNode,
         versionData: SnapshotVersionData? = null,
-        trashData: SnapshotTrashData? = null
+        trashData: SnapshotTrashData? = null,
+        postSnapshotWalEntries: (() -> List<WalEntry>)? = null
     ) {
         if (storage == null) return
         FLog.d(TAG, "saveSnapshot: saving snapshot and clearing WAL")
@@ -251,9 +254,15 @@ internal class VfsPersistenceManager(
         if (trashData != null) {
             atomicWrite(config.trashKey, VfsPersistenceCodec.encodeTrashData(trashData))
         }
-        // Step 4: 清空 WAL（最后执行，保证崩溃安全）
+        // Step 4: 清空 WAL，然后重新写入快照无法涵盖的条目（如挂载点 xattr overlay）
         walEntries.clear()
-        storage.write(config.walKey, VfsPersistenceCodec.encodeWal(walEntries))
+        val extraEntries = postSnapshotWalEntries?.invoke() ?: emptyList()
+        if (extraEntries.isNotEmpty()) {
+            walEntries.addAll(extraEntries)
+            FLog.d(TAG, "saveSnapshot: re-added ${extraEntries.size} post-snapshot WAL entries")
+        }
+        // 使用新行格式批量写入
+        storage.write(config.walKey, VfsPersistenceCodec.encodeWalEntries(walEntries))
         opsSinceSnapshot = 0
     }
 

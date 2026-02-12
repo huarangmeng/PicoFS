@@ -67,11 +67,49 @@ internal object VfsPersistenceCodec {
     fun decodeSnapshot(bytes: ByteArray): SnapshotNode =
         json.decodeFromString(SnapshotNode.serializer(), unwrapCrc(bytes))
 
-    fun encodeWal(entries: List<WalEntry>): ByteArray =
-        wrapWithCrc(json.encodeToString(ListSerializer(WalEntry.serializer()), entries))
+    // ── WAL 编解码（每行一条 entry + 独立 CRC） ──
 
-    fun decodeWal(bytes: ByteArray): List<WalEntry> =
-        json.decodeFromString(ListSerializer(WalEntry.serializer()), unwrapCrc(bytes))
+    /** 编码单条 WAL entry 为一行 "CRC:<hex8>\t<json>\n" 格式。 */
+    fun encodeWalEntry(entry: WalEntry): ByteArray {
+        val jsonStr = json.encodeToString(WalEntry.serializer(), entry)
+        val crc = crc32(jsonStr.encodeToByteArray())
+        return "$CRC_HEADER$crc\t$jsonStr\n".encodeToByteArray()
+    }
+
+    /** 编码多条 WAL entries 为行格式（用于快照后批量回写）。 */
+    fun encodeWalEntries(entries: List<WalEntry>): ByteArray {
+        if (entries.isEmpty()) return ByteArray(0)
+        val sb = StringBuilder()
+        for (entry in entries) {
+            val jsonStr = json.encodeToString(WalEntry.serializer(), entry)
+            val crc = crc32(jsonStr.encodeToByteArray())
+            sb.append("$CRC_HEADER$crc\t$jsonStr\n")
+        }
+        return sb.toString().encodeToByteArray()
+    }
+
+    /** 解码行格式 WAL。每行 "CRC:<hex8>\t<json>"，CRC 校验失败的行跳过。 */
+    fun decodeWalLines(bytes: ByteArray): List<WalEntry> {
+        val text = bytes.decodeToString()
+        if (text.isBlank()) return emptyList()
+        val entries = mutableListOf<WalEntry>()
+        for (line in text.lines()) {
+            if (line.isBlank()) continue
+            if (!line.startsWith(CRC_HEADER)) continue
+            val tabIndex = line.indexOf('\t')
+            if (tabIndex < 0) continue
+            val expectedCrc = line.substring(CRC_HEADER.length, tabIndex)
+            val jsonPayload = line.substring(tabIndex + 1)
+            val actualCrc = crc32(jsonPayload.encodeToByteArray())
+            if (expectedCrc != actualCrc) continue // 跳过损坏行
+            try {
+                entries.add(json.decodeFromString(WalEntry.serializer(), jsonPayload))
+            } catch (_: Exception) {
+                // 跳过无法解析的行
+            }
+        }
+        return entries
+    }
 
     fun encodeMounts(mounts: List<MountInfo>): ByteArray =
         wrapWithCrc(json.encodeToString(ListSerializer(MountInfo.serializer()), mounts))

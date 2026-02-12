@@ -24,7 +24,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.RandomAccessFile
-import java.nio.ByteBuffer
 import java.nio.file.FileSystems
 import java.nio.file.FileVisitResult
 import java.nio.file.Files
@@ -33,7 +32,6 @@ import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardWatchEventKinds
 import java.nio.file.WatchKey
 import java.nio.file.attribute.BasicFileAttributes
-import java.nio.file.attribute.UserDefinedFileAttributeView
 
 actual fun createDiskFileOperations(rootPath: String): DiskFileOperations =
     AndroidDiskFileOperations(rootPath)
@@ -160,94 +158,9 @@ internal class AndroidDiskFileOperations(override val rootPath: String) : DiskFi
     }
 
     // ═══════════════════════════════════════════════════════════
-    // xattr — 基于 UserDefinedFileAttributeView (API 26+)
-    //
-    // Android API 24-25 不支持 UserDefinedFileAttributeView，
-    // 此时回退到默认的 "not supported" 错误。
+    // xattr — 由 InMemoryFileSystem 的 mountXattrs overlay 处理，
+    // 平台层使用接口默认实现（返回 not supported）。
     // ═══════════════════════════════════════════════════════════
-
-    @Suppress("NewApi")
-    override suspend fun setXattr(path: String, name: String, value: ByteArray): Result<Unit> =
-        withContext(Dispatchers.IO) {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-                return@withContext Result.failure(FsError.PermissionDenied("xattr requires API 26+"))
-            }
-            runCatching {
-                val file = resolve(path)
-                if (!file.exists()) throw FsError.NotFound(path)
-                val view = Files.getFileAttributeView(
-                    file.toPath(),
-                    UserDefinedFileAttributeView::class.java
-                ) ?: throw FsError.PermissionDenied("xattr not supported on this filesystem: $path")
-                view.write(name, ByteBuffer.wrap(value))
-                Unit
-            }
-        }
-
-    @Suppress("NewApi")
-    override suspend fun getXattr(path: String, name: String): Result<ByteArray> =
-        withContext(Dispatchers.IO) {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-                return@withContext Result.failure(FsError.PermissionDenied("xattr requires API 26+"))
-            }
-            runCatching {
-                val file = resolve(path)
-                if (!file.exists()) throw FsError.NotFound(path)
-                val view = Files.getFileAttributeView(
-                    file.toPath(),
-                    UserDefinedFileAttributeView::class.java
-                ) ?: throw FsError.PermissionDenied("xattr not supported on this filesystem: $path")
-                val size = try {
-                    view.size(name)
-                } catch (_: Exception) {
-                    throw FsError.NotFound("xattr '$name' on $path")
-                }
-                val buf = ByteBuffer.allocate(size)
-                view.read(name, buf)
-                buf.flip()
-                val bytes = ByteArray(buf.remaining())
-                buf.get(bytes)
-                bytes
-            }
-        }
-
-    @Suppress("NewApi")
-    override suspend fun removeXattr(path: String, name: String): Result<Unit> =
-        withContext(Dispatchers.IO) {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-                return@withContext Result.failure(FsError.PermissionDenied("xattr requires API 26+"))
-            }
-            runCatching {
-                val file = resolve(path)
-                if (!file.exists()) throw FsError.NotFound(path)
-                val view = Files.getFileAttributeView(
-                    file.toPath(),
-                    UserDefinedFileAttributeView::class.java
-                ) ?: throw FsError.PermissionDenied("xattr not supported on this filesystem: $path")
-                try {
-                    view.delete(name)
-                } catch (_: Exception) {
-                    throw FsError.NotFound("xattr '$name' on $path")
-                }
-            }
-        }
-
-    @Suppress("NewApi")
-    override suspend fun listXattrs(path: String): Result<List<String>> =
-        withContext(Dispatchers.IO) {
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
-                return@withContext Result.failure(FsError.PermissionDenied("xattr requires API 26+"))
-            }
-            runCatching {
-                val file = resolve(path)
-                if (!file.exists()) throw FsError.NotFound(path)
-                val view = Files.getFileAttributeView(
-                    file.toPath(),
-                    UserDefinedFileAttributeView::class.java
-                ) ?: throw FsError.PermissionDenied("xattr not supported on this filesystem: $path")
-                view.list()
-            }
-        }
 
     // ═══════════════════════════════════════════════════════════
     // archive — 基于 java.util.zip
