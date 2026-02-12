@@ -8,8 +8,9 @@ import com.hrm.fs.core.persistence.PersistenceConfig
 import com.hrm.fs.core.persistence.SnapshotNode
 import com.hrm.fs.core.persistence.SnapshotTrashData
 import com.hrm.fs.core.persistence.SnapshotVersionData
-import com.hrm.fs.core.persistence.VfsPersistenceCodec
+import com.hrm.fs.core.persistence.VfsCodec
 import com.hrm.fs.core.persistence.WalEntry
+import com.hrm.fs.core.persistence.unwrapCrc
 
 /**
  * 持久化管理器。
@@ -38,6 +39,7 @@ internal class VfsPersistenceManager(
         private const val TAG = "VfsPersistence"
     }
 
+    private val codec: VfsCodec = config.createCodec()
     private val walEntries: MutableList<WalEntry> = mutableListOf()
     private var opsSinceSnapshot: Int = 0
     private var loaded: Boolean = false
@@ -68,17 +70,16 @@ internal class VfsPersistenceManager(
 
     private suspend fun load(): LoadResult? {
         if (storage == null) return null
-        FLog.d(TAG, "load: reading from storage")
+        FLog.d(TAG, "load: reading from storage (codec=${codec.name})")
         val warnings = mutableListOf<String>()
 
         // ── 读取 Snapshot（容错） ──
-        // 优先读正式 key，若不存在或损坏，尝试从临时 key 恢复
         val snapshot = loadSnapshotWithFallback(warnings)
 
         // ── 读取 WAL（容错） ──
         val wal = try {
             storage.read(config.walKey).getOrNull()?.let {
-                VfsPersistenceCodec.decodeWalLines(it)
+                codec.decodeWalEntries(it)
             }.orEmpty()
         } catch (e: CorruptedDataException) {
             val msg = "WAL corrupted (CRC mismatch), skipping WAL replay: ${e.message}"
@@ -106,7 +107,7 @@ internal class VfsPersistenceManager(
         // ── 读取 Mounts（容错） ──
         val mountInfos = try {
             storage.read(config.mountsKey).getOrNull()?.let {
-                VfsPersistenceCodec.decodeMounts(it)
+                codec.decodeMounts(it)
             }.orEmpty()
         } catch (e: Exception) {
             val msg = "Mounts data corrupted, using empty mounts: ${e.message}"
@@ -118,7 +119,7 @@ internal class VfsPersistenceManager(
         // ── 读取 Versions（容错） ──
         val versionData = try {
             storage.read(config.versionsKey).getOrNull()?.let {
-                VfsPersistenceCodec.decodeVersionData(it)
+                codec.decodeVersionData(it)
             }
         } catch (e: Exception) {
             val msg = "Versions data corrupted, using empty versions: ${e.message}"
@@ -130,7 +131,7 @@ internal class VfsPersistenceManager(
         // ── 读取 Trash（容错） ──
         val trashData = try {
             storage.read(config.trashKey).getOrNull()?.let {
-                VfsPersistenceCodec.decodeTrashData(it)
+                codec.decodeTrashData(it)
             }
         } catch (e: Exception) {
             val msg = "Trash data corrupted, using empty trash: ${e.message}"
@@ -148,14 +149,11 @@ internal class VfsPersistenceManager(
 
     /**
      * 加载 snapshot 并支持从临时 key 回退。
-     * 写入顺序：先写 `key.tmp` → 校验 → 替换 `key` → 删 `key.tmp`
-     * 如果正式 key 损坏但临时 key 存在且有效，则从临时 key 恢复。
      */
     private suspend fun loadSnapshotWithFallback(warnings: MutableList<String>): SnapshotNode? {
-        // 尝试读取正式 key
         val primary = try {
             storage!!.read(config.snapshotKey).getOrNull()?.let {
-                VfsPersistenceCodec.decodeSnapshot(it)
+                codec.decodeSnapshot(it)
             }
         } catch (e: CorruptedDataException) {
             val msg = "Snapshot corrupted (CRC mismatch): ${e.message}"
@@ -169,16 +167,14 @@ internal class VfsPersistenceManager(
             null
         }
         if (primary != null) {
-            // 清除可能残留的临时 key
             try { storage!!.delete(tmpKey(config.snapshotKey)) } catch (_: Exception) {}
             return primary
         }
         // 尝试从临时 key 恢复
         return try {
             storage!!.read(tmpKey(config.snapshotKey)).getOrNull()?.let {
-                val snapshot = VfsPersistenceCodec.decodeSnapshot(it)
-                // 临时 key 有效，提升为正式 key
-                storage.write(config.snapshotKey, VfsPersistenceCodec.encodeSnapshot(snapshot))
+                val snapshot = codec.decodeSnapshot(it)
+                storage.write(config.snapshotKey, codec.encodeSnapshot(snapshot))
                 storage.delete(tmpKey(config.snapshotKey))
                 FLog.i(TAG, "Recovered snapshot from temporary key")
                 snapshot
@@ -196,11 +192,6 @@ internal class VfsPersistenceManager(
     /**
      * 追加一条 WAL 条目并持久化（增量追加 O(1)）。
      * 达到阈值时自动触发快照。
-     *
-     * 新 WAL 格式：每行一条 "CRC:<hex8>\t<json>\n"，追加时只编码并 append 新条目。
-     *
-     * @param snapshotProvider 生成当前快照的回调（惰性，仅在需要快照时调用）
-     * @param versionDataProvider 生成版本数据的回调（惰性）
      */
     suspend fun appendWal(
         entry: WalEntry,
@@ -214,7 +205,7 @@ internal class VfsPersistenceManager(
         opsSinceSnapshot++
         // 增量追加：读取已有 WAL 数据，拼接新条目
         val existing = storage.read(config.walKey).getOrNull() ?: ByteArray(0)
-        val newEntryBytes = VfsPersistenceCodec.encodeWalEntry(entry)
+        val newEntryBytes = codec.encodeWalEntry(entry)
         storage.write(config.walKey, existing + newEntryBytes)
         FLog.v(TAG, "appendWal: opsSinceSnapshot=$opsSinceSnapshot, entry=$entry")
         if (opsSinceSnapshot >= config.autoSnapshotEvery) {
@@ -231,10 +222,6 @@ internal class VfsPersistenceManager(
      *   2. 读回 `key.tmp` 校验 CRC 完整性
      *   3. 写 `key`（正式）
      *   4. 删 `key.tmp`
-     *
-     * 如果在步骤 3 后崩溃：下次加载时 `key` 已有效，`key.tmp` 残留无影响。
-     * 如果在步骤 1-2 间崩溃：下次加载时 `key` 仍为旧数据，`key.tmp` 损坏会被忽略。
-     * 如果在步骤 2-3 间崩溃：下次加载时 `key` 可能损坏，但 `key.tmp` 有效可恢复。
      */
     suspend fun saveSnapshot(
         snapshot: SnapshotNode,
@@ -244,25 +231,21 @@ internal class VfsPersistenceManager(
     ) {
         if (storage == null) return
         FLog.d(TAG, "saveSnapshot: saving snapshot and clearing WAL")
-        // Step 1: 原子写入 snapshot
-        atomicWrite(config.snapshotKey, VfsPersistenceCodec.encodeSnapshot(snapshot))
-        // Step 2: 原子写入 versions
+        atomicWrite(config.snapshotKey, codec.encodeSnapshot(snapshot))
         if (versionData != null) {
-            atomicWrite(config.versionsKey, VfsPersistenceCodec.encodeVersionData(versionData))
+            atomicWrite(config.versionsKey, codec.encodeVersionData(versionData))
         }
-        // Step 3: 原子写入 trash
         if (trashData != null) {
-            atomicWrite(config.trashKey, VfsPersistenceCodec.encodeTrashData(trashData))
+            atomicWrite(config.trashKey, codec.encodeTrashData(trashData))
         }
-        // Step 4: 清空 WAL，然后重新写入快照无法涵盖的条目（如挂载点 xattr overlay）
+        // 清空 WAL，然后重新写入快照无法涵盖的条目（如挂载点 xattr overlay）
         walEntries.clear()
         val extraEntries = postSnapshotWalEntries?.invoke() ?: emptyList()
         if (extraEntries.isNotEmpty()) {
             walEntries.addAll(extraEntries)
             FLog.d(TAG, "saveSnapshot: re-added ${extraEntries.size} post-snapshot WAL entries")
         }
-        // 使用新行格式批量写入
-        storage.write(config.walKey, VfsPersistenceCodec.encodeWalEntries(walEntries))
+        storage.write(config.walKey, codec.encodeWalEntries(walEntries))
         opsSinceSnapshot = 0
     }
 
@@ -272,20 +255,17 @@ internal class VfsPersistenceManager(
     private suspend fun atomicWrite(key: String, data: ByteArray) {
         val tmp = tmpKey(key)
         storage!!.write(tmp, data)
-        // 读回校验完整性
         try {
             val readBack = storage.read(tmp).getOrNull()
             if (readBack != null) {
-                VfsPersistenceCodec.unwrapCrc(readBack) // 仅校验，不使用返回值
+                unwrapCrc(readBack) // 仅校验 CRC，不使用返回值
             }
         } catch (e: Exception) {
             FLog.w(TAG, "atomicWrite: CRC verification failed for $tmp, retrying direct write: ${e.message}")
-            // 回退为直接写
             storage.write(key, data)
             try { storage.delete(tmp) } catch (_: Exception) {}
             return
         }
-        // CRC 校验通过，替换正式 key
         storage.write(key, data)
         try { storage.delete(tmp) } catch (_: Exception) {}
     }
@@ -296,13 +276,13 @@ internal class VfsPersistenceManager(
 
     suspend fun persistMounts(mountInfos: List<MountInfo>) {
         if (storage == null) return
-        storage.write(config.mountsKey, VfsPersistenceCodec.encodeMounts(mountInfos))
+        storage.write(config.mountsKey, codec.encodeMounts(mountInfos))
     }
 
     // ── 回收站持久化 ─────────────────────────────────────────
 
     suspend fun persistTrash(trashData: SnapshotTrashData) {
         if (storage == null) return
-        storage.write(config.trashKey, VfsPersistenceCodec.encodeTrashData(trashData))
+        storage.write(config.trashKey, codec.encodeTrashData(trashData))
     }
 }

@@ -13,7 +13,7 @@ class CrashRecoveryTest {
         val cfg = PersistenceConfig(autoSnapshotEvery = 1)
         val fs1 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         fs1.writeAll("/f.txt", "snapshot-data".encodeToByteArray()).getOrThrow()
-        storage.write("vfs_wal.json", "CORRUPTED_DATA{{{".encodeToByteArray())
+        storage.write(cfg.walKey, "CORRUPTED_DATA{{{".encodeToByteArray())
         val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         assertEquals("snapshot-data", fs2.readAll("/f.txt").getOrThrow().decodeToString())
     }
@@ -21,22 +21,24 @@ class CrashRecoveryTest {
     @Test
     fun corrupted_snapshot_with_valid_wal() = runTest {
         val storage = InMemoryFsStorage()
-        val fs1 = InMemoryFileSystem(storage = storage)
+        val cfg = PersistenceConfig()
+        val fs1 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         fs1.createDir("/data").getOrThrow()
         fs1.createFile("/data/file.txt").getOrThrow()
-        storage.write("vfs_snapshot.json", "BROKEN!!!".encodeToByteArray())
-        val fs2 = InMemoryFileSystem(storage = storage)
+        storage.write(cfg.snapshotKey, "BROKEN!!!".encodeToByteArray())
+        val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         assertEquals(FsType.FILE, fs2.stat("/data/file.txt").getOrThrow().type)
     }
 
     @Test
     fun both_corrupted_starts_empty() = runTest {
         val storage = InMemoryFsStorage()
-        val fs1 = InMemoryFileSystem(storage = storage)
+        val cfg = PersistenceConfig()
+        val fs1 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         fs1.writeAll("/f.txt", "data".encodeToByteArray()).getOrThrow()
-        storage.write("vfs_snapshot.json", "BAD_SNAPSHOT".encodeToByteArray())
-        storage.write("vfs_wal.json", "BAD_WAL".encodeToByteArray())
-        val fs2 = InMemoryFileSystem(storage = storage)
+        storage.write(cfg.snapshotKey, "BAD_SNAPSHOT".encodeToByteArray())
+        storage.write(cfg.walKey, "BAD_WAL".encodeToByteArray())
+        val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         assertTrue(fs2.stat("/f.txt").isFailure)
         fs2.writeAll("/new.txt", "fresh".encodeToByteArray()).getOrThrow()
         assertEquals("fresh", fs2.readAll("/new.txt").getOrThrow().decodeToString())
@@ -48,7 +50,8 @@ class CrashRecoveryTest {
         val cfg = PersistenceConfig(autoSnapshotEvery = 1)
         val fs1 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         fs1.writeAll("/f.txt", "safe-data".encodeToByteArray()).getOrThrow()
-        storage.write("vfs_wal.json", "CRC:deadbeef\n[{\"type\":\"CreateFile\",\"path\":\"/bad.txt\"}]".encodeToByteArray())
+        // Write binary garbage with fake CRC header (will fail CRC check)
+        storage.write(cfg.walKey, byteArrayOf(0xDE.toByte(), 0xAD.toByte(), 0xBE.toByte(), 0xEF.toByte(), 0, 0, 0, 5, 1, 2, 3, 4, 5))
         val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         assertEquals("safe-data", fs2.readAll("/f.txt").getOrThrow().decodeToString())
         assertTrue(fs2.stat("/bad.txt").isFailure)
@@ -57,11 +60,13 @@ class CrashRecoveryTest {
     @Test
     fun snapshot_crc_mismatch_wal_valid() = runTest {
         val storage = InMemoryFsStorage()
-        val fs1 = InMemoryFileSystem(storage = storage)
+        val cfg = PersistenceConfig()
+        val fs1 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         fs1.createDir("/d").getOrThrow()
         fs1.createFile("/d/f.txt").getOrThrow()
-        storage.write("vfs_snapshot.json", "CRC:00000000\n{\"name\":\"bad\"}".encodeToByteArray())
-        val fs2 = InMemoryFileSystem(storage = storage)
+        // Write binary garbage with wrong CRC for snapshot
+        storage.write(cfg.snapshotKey, byteArrayOf(0, 0, 0, 0, 1, 2, 3))
+        val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         assertEquals(FsType.FILE, fs2.stat("/d/f.txt").getOrThrow().type)
     }
 
@@ -72,7 +77,7 @@ class CrashRecoveryTest {
         val fs1 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         fs1.writeAll("/f.txt", "data".encodeToByteArray()).getOrThrow()
         fs1.mounts.mount("/mnt", FakeDiskFileOperations()).getOrThrow()
-        storage.write("vfs_mounts.json", "NOT_JSON!!!".encodeToByteArray())
+        storage.write(cfg.mountsKey, "NOT_VALID!!!".encodeToByteArray())
         val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         assertEquals("data", fs2.readAll("/f.txt").getOrThrow().decodeToString())
         assertTrue(fs2.mounts.pending().isEmpty())
@@ -85,7 +90,7 @@ class CrashRecoveryTest {
         val fs1 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         fs1.writeAll("/f.txt", "v1".encodeToByteArray()).getOrThrow()
         fs1.writeAll("/f.txt", "v2".encodeToByteArray()).getOrThrow()
-        storage.write("vfs_versions.json", "CORRUPT".encodeToByteArray())
+        storage.write(cfg.versionsKey, "CORRUPT".encodeToByteArray())
         val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         assertEquals("v2", fs2.readAll("/f.txt").getOrThrow().decodeToString())
         assertTrue(fs2.versions.list("/f.txt").getOrThrow().isEmpty())
@@ -94,14 +99,15 @@ class CrashRecoveryTest {
     @Test
     fun wal_cleared_after_corruption() = runTest {
         val storage = InMemoryFsStorage()
-        val fs1 = InMemoryFileSystem(storage = storage)
+        val cfg = PersistenceConfig()
+        val fs1 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         fs1.createDir("/d").getOrThrow()
-        storage.write("vfs_wal.json", "BROKEN".encodeToByteArray())
-        val fs2 = InMemoryFileSystem(storage = storage)
+        storage.write(cfg.walKey, "BROKEN".encodeToByteArray())
+        val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         fs2.stat("/").getOrThrow()
         fs2.createDir("/new_dir").getOrThrow()
         fs2.createFile("/new_dir/f.txt").getOrThrow()
-        val fs3 = InMemoryFileSystem(storage = storage)
+        val fs3 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         assertEquals(FsType.FILE, fs3.stat("/new_dir/f.txt").getOrThrow().type)
     }
 
@@ -113,7 +119,7 @@ class CrashRecoveryTest {
         fs1.createDir("/d").getOrThrow()
         fs1.createFile("/d/a.txt").getOrThrow()
         fs1.createFile("/d/b.txt").getOrThrow()
-        storage.write("vfs_wal.json", "PARTIAL_WRITE".encodeToByteArray())
+        storage.write(cfg.walKey, "PARTIAL_WRITE".encodeToByteArray())
         val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         assertTrue(fs2.stat("/d/a.txt").isSuccess)
         assertTrue(fs2.stat("/d/b.txt").isFailure)
@@ -126,8 +132,9 @@ class CrashRecoveryTest {
         val fs1 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         fs1.createDir("/d").getOrThrow()
         fs1.createFile("/d/f.txt").getOrThrow()
-        val walText = storage.read("vfs_wal.json").getOrThrow()!!.decodeToString()
-        assertTrue(walText.startsWith("CRC:"), "WAL should have CRC header")
+        val walData = storage.read(cfg.walKey).getOrThrow()!!
+        // Binary WAL format: starts with 4-byte CRC32 (not text "CRC:")
+        assertTrue(walData.size >= 8, "WAL should have binary CRC + length header")
         val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         assertTrue(fs2.stat("/d/f.txt").isSuccess)
     }
@@ -138,8 +145,9 @@ class CrashRecoveryTest {
         val cfg = PersistenceConfig(autoSnapshotEvery = 1)
         val fs1 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         fs1.writeAll("/f.txt", "data".encodeToByteArray()).getOrThrow()
-        val snapText = storage.read("vfs_snapshot.json").getOrThrow()!!.decodeToString()
-        assertTrue(snapText.startsWith("CRC:"), "Snapshot should have CRC header")
+        val snapData = storage.read(cfg.snapshotKey).getOrThrow()!!
+        // Binary snapshot format: starts with 4-byte CRC32
+        assertTrue(snapData.size >= 4, "Snapshot should have binary CRC header")
         val fs2 = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         assertEquals("data", fs2.readAll("/f.txt").getOrThrow().decodeToString())
     }
@@ -147,9 +155,10 @@ class CrashRecoveryTest {
     @Test
     fun no_crc_header_treated_as_corrupted() = runTest {
         val storage = InMemoryFsStorage()
-        val rawWal = """[{"type":"CreateDir","path":"/legacy"},{"type":"CreateFile","path":"/legacy/old.txt"}]"""
-        storage.write("vfs_wal.json", rawWal.encodeToByteArray())
-        val fs = InMemoryFileSystem(storage = storage)
+        val cfg = PersistenceConfig()
+        // Write text data (invalid binary format) — should be treated as corrupted
+        storage.write(cfg.walKey, "some random text data".encodeToByteArray())
+        val fs = InMemoryFileSystem(storage = storage, persistenceConfig = cfg)
         assertTrue(fs.stat("/legacy").isFailure)
         assertTrue(fs.stat("/legacy/old.txt").isFailure)
         fs.writeAll("/new.txt", "ok".encodeToByteArray()).getOrThrow()

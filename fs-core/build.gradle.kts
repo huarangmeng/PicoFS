@@ -40,7 +40,7 @@ kotlin {
                 implementation(projects.fsApi)
                 implementation(projects.fsPlatform)
                 implementation(libs.kotlinx.coroutines.core)
-                implementation(libs.kotlinx.serialization.json)
+                implementation(libs.kotlinx.serialization.cbor)
             }
         }
 
