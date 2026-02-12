@@ -78,7 +78,14 @@ internal class InMemoryFileSystem(
         private const val TAG = "InMemoryFS"
     }
 
-    private val rwLock = CoroutineReadWriteMutex()
+    /**
+     * Layer 1: TreeLock（全局读写锁）— 保护树结构（节点增删、路径解析）。
+     *
+     * - 树结构变更（create/delete/move）取 writeLock
+     * - 路径解析 + 节点读取取 readLock
+     * - 持有时间极短，不在此锁内做文件 IO
+     */
+    private val treeLock = CoroutineReadWriteMutex()
     internal val tree = VfsTree()
     internal val mountTable = MountTable()
     internal val eventBus = VfsEventBus()
@@ -513,18 +520,21 @@ internal class InMemoryFileSystem(
 
     // ═══════════════════════════════════════════════════════════
     // InMemoryFileHandle 的 readAt / writeAt（内部调用）
+    //
+    // Handle 已持有解析后的 FileNode 引用，这里仅需节点级锁，
+    // 不同文件的 readAt/writeAt 完全并行。
     // ═══════════════════════════════════════════════════════════
 
     internal suspend fun readAt(node: FileNode, offset: Long, length: Int): Result<ByteArray> =
-        readLocked { tree.readAt(node, offset, length) }
+        node.nodeLock.withReadLock { tree.readAt(node, offset, length) }
 
     internal suspend fun writeAt(node: FileNode, offset: Long, data: ByteArray, path: String): Result<Unit> =
-        writeLocked {
+        node.nodeLock.withWriteLock {
             val end = offset.toInt() + data.size
             val growth = maxOf(0L, end.toLong() - node.size.toLong())
             checkQuota(growth)?.let {
                 FLog.w(TAG, "writeAt failed: quota exceeded, growth=$growth")
-                return@writeLocked it
+                return@withWriteLock it
             }
             if (node.size > 0) {
                 val oldData = node.blocks.toByteArray()
@@ -1597,8 +1607,10 @@ internal class InMemoryFileSystem(
         persistence.persistTrash(SnapshotTrashData(trashManager.toSnapshotEntries()))
     }
 
-    internal suspend fun <T> readLocked(block: suspend () -> T): T = rwLock.withReadLock { block() }
-    internal suspend fun <T> writeLocked(block: suspend () -> T): T = rwLock.withWriteLock { block() }
+    /** TreeLock 读锁：保护路径解析和节点读取。 */
+    internal suspend fun <T> readLocked(block: suspend () -> T): T = treeLock.withReadLock { block() }
+    /** TreeLock 写锁：保护树结构变更（create/delete/move）。 */
+    internal suspend fun <T> writeLocked(block: suspend () -> T): T = treeLock.withWriteLock { block() }
 
     internal fun invalidateCache(path: String) {
         statCache.remove(path)

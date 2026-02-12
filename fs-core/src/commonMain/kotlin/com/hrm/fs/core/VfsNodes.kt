@@ -11,6 +11,9 @@ internal sealed class VfsNode(
     var modifiedAtMillis: Long,
     var permissions: FsPermissions
 ) {
+    /** 节点级读写锁：保护节点内容（blocks/children/xattrs/metadata）。 */
+    val nodeLock = CoroutineReadWriteMutex()
+
     /** 扩展属性（xattr）：name -> value。所有节点类型都可以有扩展属性。 */
     val xattrs: MutableMap<String, ByteArray> = LinkedHashMap()
 }

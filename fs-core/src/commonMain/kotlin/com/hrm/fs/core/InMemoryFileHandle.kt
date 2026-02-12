@@ -19,6 +19,13 @@ internal object HandleIdGenerator {
     fun next(): Long = counter.fetchAndAdd(1L)
 }
 
+/**
+ * 内存文件句柄。
+ *
+ * 持有解析后的 [FileNode] 引用，readAt/writeAt 直接操作节点级锁，
+ * 跳过 TreeLock —— open() 时付出一次路径解析代价，后续操作零 TreeLock 开销，
+ * 不同文件的 Handle 操作完全并行。
+ */
 internal class InMemoryFileHandle(
     private val fs: InMemoryFileSystem,
     private val node: FileNode,

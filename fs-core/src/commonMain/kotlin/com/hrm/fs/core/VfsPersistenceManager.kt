@@ -11,6 +11,8 @@ import com.hrm.fs.core.persistence.SnapshotVersionData
 import com.hrm.fs.core.persistence.VfsCodec
 import com.hrm.fs.core.persistence.WalEntry
 import com.hrm.fs.core.persistence.unwrapCrc
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * 持久化管理器。
@@ -38,6 +40,9 @@ internal class VfsPersistenceManager(
     companion object {
         private const val TAG = "VfsPersistence"
     }
+
+    /** WAL 独立锁：保护 walEntries 列表和 storage.append 的原子性。 */
+    private val walMutex = Mutex()
 
     private val codec: VfsCodec = config.createCodec()
     private val walEntries: MutableList<WalEntry> = mutableListOf()
@@ -210,20 +215,34 @@ internal class VfsPersistenceManager(
         postSnapshotWalEntries: (() -> List<WalEntry>)? = null
     ) {
         if (storage == null) return
-        walEntries.add(entry)
-        opsSinceSnapshot++
-        // 增量追加：直接 append 新条目（O(1)）
-        val newEntryBytes = codec.encodeWalEntry(entry)
-        storage.append(config.walKey, newEntryBytes)
-        FLog.v(TAG, "appendWal: opsSinceSnapshot=$opsSinceSnapshot, entry=$entry")
-        if (opsSinceSnapshot >= config.autoSnapshotEvery) {
-            FLog.d(TAG, "appendWal: auto snapshot triggered at $opsSinceSnapshot ops")
-            saveSnapshot(snapshotProvider(), versionDataProvider(), trashDataProvider(), postSnapshotWalEntries)
+        walMutex.withLock {
+            walEntries.add(entry)
+            opsSinceSnapshot++
+            // 增量追加：直接 append 新条目（O(1)）
+            val newEntryBytes = codec.encodeWalEntry(entry)
+            storage.append(config.walKey, newEntryBytes)
+            FLog.v(TAG, "appendWal: opsSinceSnapshot=$opsSinceSnapshot, entry=$entry")
+            if (opsSinceSnapshot >= config.autoSnapshotEvery) {
+                FLog.d(TAG, "appendWal: auto snapshot triggered at $opsSinceSnapshot ops")
+                saveSnapshotInternal(snapshotProvider(), versionDataProvider(), trashDataProvider(), postSnapshotWalEntries)
+            }
+        }
+    }
+
+    suspend fun saveSnapshot(
+        snapshot: SnapshotNode,
+        versionData: SnapshotVersionData? = null,
+        trashData: SnapshotTrashData? = null,
+        postSnapshotWalEntries: (() -> List<WalEntry>)? = null
+    ) {
+        if (storage == null) return
+        walMutex.withLock {
+            saveSnapshotInternal(snapshot, versionData, trashData, postSnapshotWalEntries)
         }
     }
 
     /**
-     * 保存快照并清空 WAL。
+     * 保存快照并清空 WAL（内部方法，调用方需持有 walMutex）。
      *
      * 原子写入流程（每个 key）：
      *   1. 写 `key.tmp`（临时）
@@ -231,7 +250,7 @@ internal class VfsPersistenceManager(
      *   3. 写 `key`（正式）
      *   4. 删 `key.tmp`
      */
-    suspend fun saveSnapshot(
+    private suspend fun saveSnapshotInternal(
         snapshot: SnapshotNode,
         versionData: SnapshotVersionData? = null,
         trashData: SnapshotTrashData? = null,
