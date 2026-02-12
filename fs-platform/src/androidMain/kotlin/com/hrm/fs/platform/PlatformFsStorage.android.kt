@@ -40,6 +40,14 @@ internal class AndroidFileFsStorage(private val dirPath: String) : FsStorage {
         }
     }
 
+    override suspend fun append(key: String, data: ByteArray): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val file = keyToFile(key)
+            java.io.FileOutputStream(file, true).use { it.write(data) }
+            Unit
+        }
+    }
+
     private fun keyToFile(key: String): File {
         val safeName = key.map { ch ->
             if (ch.isLetterOrDigit() || ch == '-') ch.toString()

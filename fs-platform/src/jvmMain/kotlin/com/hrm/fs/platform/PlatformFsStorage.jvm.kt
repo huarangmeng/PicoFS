@@ -41,6 +41,14 @@ internal class FileFsStorage(private val dirPath: String) : FsStorage {
         }
     }
 
+    override suspend fun append(key: String, data: ByteArray): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val file = keyToFile(key)
+            java.io.FileOutputStream(file, true).use { it.write(data) }
+            Unit
+        }
+    }
+
     /**
      * 将 key 编码为安全的文件名。
      * 使用 URL 编码风格：将非字母数字字符替换为 _XX 形式。

@@ -9,11 +9,16 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.withContext
 import platform.Foundation.NSData
+import platform.Foundation.NSFileHandle
 import platform.Foundation.NSFileManager
 import platform.Foundation.NSString
+import platform.Foundation.closeFile
 import platform.Foundation.create
 import platform.Foundation.dataWithContentsOfFile
+import platform.Foundation.fileHandleForWritingAtPath
+import platform.Foundation.seekToEndOfFile
 import platform.Foundation.stringByAppendingPathComponent
+import platform.Foundation.writeData
 import platform.Foundation.writeToFile
 import platform.posix.memcpy
 
@@ -64,6 +69,30 @@ internal class IosFsStorage(private val dirPath: String) : FsStorage {
             val path = keyToPath(key)
             if (fm.fileExistsAtPath(path)) {
                 fm.removeItemAtPath(path, error = null)
+            }
+            Unit
+        }
+    }
+
+    override suspend fun append(key: String, data: ByteArray): Result<Unit> = withContext(Dispatchers.IO) {
+        runCatching {
+            val path = keyToPath(key)
+            if (!fm.fileExistsAtPath(path)) {
+                // 文件不存在，直接写入
+                val nsData = data.toNSData()
+                nsData.writeToFile(path, atomically = true)
+            } else {
+                // 文件存在，使用 NSFileHandle append
+                val handle = NSFileHandle.fileHandleForWritingAtPath(path)
+                if (handle != null) {
+                    handle.seekToEndOfFile()
+                    handle.writeData(data.toNSData())
+                    handle.closeFile()
+                } else {
+                    // fallback: read + concat + write
+                    val existing = NSData.dataWithContentsOfFile(path)?.toByteArray() ?: ByteArray(0)
+                    (existing + data).toNSData().writeToFile(path, atomically = true)
+                }
             }
             Unit
         }

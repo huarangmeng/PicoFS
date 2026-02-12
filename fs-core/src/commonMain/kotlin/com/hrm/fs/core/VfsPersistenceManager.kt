@@ -77,10 +77,9 @@ internal class VfsPersistenceManager(
         val snapshot = loadSnapshotWithFallback(warnings)
 
         // ── 读取 WAL（容错） ──
+        val walRaw = storage.read(config.walKey).getOrNull()
         val wal = try {
-            storage.read(config.walKey).getOrNull()?.let {
-                codec.decodeWalEntries(it)
-            }.orEmpty()
+            walRaw?.let { codec.decodeWalEntries(it) }.orEmpty()
         } catch (e: CorruptedDataException) {
             val msg = "WAL corrupted (CRC mismatch), skipping WAL replay: ${e.message}"
             FLog.w(TAG, msg)
@@ -97,6 +96,16 @@ internal class VfsPersistenceManager(
                 storage.delete(config.walKey)
             } catch (_: Exception) { }
             emptyList()
+        }
+
+        // WAL 文件非空但解析出 0 条有效记录 → 视为损坏，清除以免污染后续 append
+        if (wal.isEmpty() && walRaw != null && walRaw.isNotEmpty()) {
+            val msg = "WAL data present (${walRaw.size} bytes) but 0 valid entries, clearing corrupted WAL"
+            FLog.w(TAG, msg)
+            warnings.add(msg)
+            try {
+                storage.delete(config.walKey)
+            } catch (_: Exception) { }
         }
 
         if (wal.isNotEmpty()) {
@@ -203,10 +212,9 @@ internal class VfsPersistenceManager(
         if (storage == null) return
         walEntries.add(entry)
         opsSinceSnapshot++
-        // 增量追加：读取已有 WAL 数据，拼接新条目
-        val existing = storage.read(config.walKey).getOrNull() ?: ByteArray(0)
+        // 增量追加：直接 append 新条目（O(1)）
         val newEntryBytes = codec.encodeWalEntry(entry)
-        storage.write(config.walKey, existing + newEntryBytes)
+        storage.append(config.walKey, newEntryBytes)
         FLog.v(TAG, "appendWal: opsSinceSnapshot=$opsSinceSnapshot, entry=$entry")
         if (opsSinceSnapshot >= config.autoSnapshotEvery) {
             FLog.d(TAG, "appendWal: auto snapshot triggered at $opsSinceSnapshot ops")

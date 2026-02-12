@@ -123,9 +123,9 @@ internal class InMemoryFileSystem(
 
     override suspend fun createFile(path: String): Result<Unit> {
         FLog.d(TAG, "createFile: path=$path")
+        locked { ensureLoaded() }
         val mark = mc.begin()
         val result = locked {
-            ensureLoaded()
             createFileNoLock(PathUtils.normalize(path))
         }
         mc.end(Op.CREATE_FILE, mark, result)
@@ -134,9 +134,9 @@ internal class InMemoryFileSystem(
 
     override suspend fun createDir(path: String): Result<Unit> {
         FLog.d(TAG, "createDir: path=$path")
+        locked { ensureLoaded() }
         val mark = mc.begin()
         val result = locked {
-            ensureLoaded()
             createDirNoLock(PathUtils.normalize(path))
         }
         mc.end(Op.CREATE_DIR, mark, result)
@@ -145,9 +145,9 @@ internal class InMemoryFileSystem(
 
     override suspend fun open(path: String, mode: OpenMode): Result<FileHandle> {
         FLog.d(TAG, "open: path=$path, mode=$mode")
+        locked { ensureLoaded() }
         val mark = mc.begin()
         val result = locked {
-            ensureLoaded()
             openNoLock(PathUtils.normalize(path), mode)
         }
         mc.end(Op.OPEN, mark, result)
@@ -155,9 +155,9 @@ internal class InMemoryFileSystem(
     }
 
     override suspend fun readDir(path: String): Result<List<FsEntry>> {
+        locked { ensureLoaded() }
         val mark = mc.begin()
         val result = locked {
-            ensureLoaded()
             readDirNoLock(PathUtils.normalize(path))
         }
         mc.end(Op.READ_DIR, mark, result)
@@ -165,9 +165,9 @@ internal class InMemoryFileSystem(
     }
 
     override suspend fun stat(path: String): Result<FsMeta> {
+        locked { ensureLoaded() }
         val mark = mc.begin()
         val result = locked {
-            ensureLoaded()
             statNoLock(PathUtils.normalize(path))
         }
         mc.end(Op.STAT, mark, result)
@@ -176,9 +176,9 @@ internal class InMemoryFileSystem(
 
     override suspend fun delete(path: String): Result<Unit> {
         FLog.d(TAG, "delete: path=$path")
+        locked { ensureLoaded() }
         val mark = mc.begin()
         val result = locked {
-            ensureLoaded()
             deleteNoLock(PathUtils.normalize(path))
         }
         mc.end(Op.DELETE, mark, result)
@@ -186,9 +186,9 @@ internal class InMemoryFileSystem(
     }
 
     override suspend fun setPermissions(path: String, permissions: FsPermissions): Result<Unit> {
+        locked { ensureLoaded() }
         val mark = mc.begin()
         val result = locked {
-            ensureLoaded()
             val normalized = PathUtils.normalize(path)
             if (mountTable.findMount(normalized) != null) return@locked Result.success(Unit)
             tree.setPermissions(normalized, permissions).also { r ->
@@ -224,9 +224,9 @@ internal class InMemoryFileSystem(
     // ═══════════════════════════════════════════════════════════
 
     override suspend fun readAll(path: String): Result<ByteArray> {
+        locked { ensureLoaded() }
         val mark = mc.begin()
         val result = locked {
-            ensureLoaded()
             val normalized = PathUtils.normalize(path)
             val data = readAllBytes(normalized)
             if (data.isSuccess) mc.addBytesRead(data.getOrThrow().size.toLong())
@@ -238,9 +238,9 @@ internal class InMemoryFileSystem(
 
     override suspend fun writeAll(path: String, data: ByteArray): Result<Unit> {
         FLog.d(TAG, "writeAll: path=$path, size=${data.size}")
+        locked { ensureLoaded() }
         val mark = mc.begin()
         val result = locked {
-            ensureLoaded()
             writeAllNoLock(PathUtils.normalize(path), data)
         }
         mc.end(Op.WRITE_ALL, mark, result)
@@ -253,9 +253,9 @@ internal class InMemoryFileSystem(
 
     override suspend fun copy(srcPath: String, dstPath: String): Result<Unit> {
         FLog.d(TAG, "copy: src=$srcPath, dst=$dstPath")
+        locked { ensureLoaded() }
         val mark = mc.begin()
         val result = locked {
-            ensureLoaded()
             val src = PathUtils.normalize(srcPath)
             val dst = PathUtils.normalize(dstPath)
             copyNoLock(src, dst).also { r ->
@@ -269,9 +269,9 @@ internal class InMemoryFileSystem(
 
     override suspend fun move(srcPath: String, dstPath: String): Result<Unit> {
         FLog.d(TAG, "move: src=$srcPath, dst=$dstPath")
+        locked { ensureLoaded() }
         val mark = mc.begin()
         val result = locked {
-            ensureLoaded()
             val src = PathUtils.normalize(srcPath)
             val dst = PathUtils.normalize(dstPath)
             copyNoLock(src, dst).getOrElse { return@locked Result.failure(it) }
@@ -599,9 +599,9 @@ internal class InMemoryFileSystem(
 
         override suspend fun sync(path: String): Result<List<FsEvent>> {
             FLog.d(TAG, "sync: path=$path")
+            locked { ensureLoaded() }
             val mark = mc.begin()
             val result = locked {
-                ensureLoaded()
                 val normalized = PathUtils.normalize(path)
                 val match = mountTable.findMount(normalized)
                     ?: return@locked Result.failure(FsError.NotMounted(normalized).also {

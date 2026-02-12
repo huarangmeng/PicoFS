@@ -1,5 +1,7 @@
 package com.hrm.fs.api
 
+import com.hrm.fs.api.FileLockType.EXCLUSIVE
+import com.hrm.fs.api.FileLockType.SHARED
 import kotlinx.coroutines.flow.Flow
 
 enum class FsType { FILE, DIRECTORY, SYMLINK }
@@ -712,6 +714,7 @@ interface FsStorage {
     suspend fun read(key: String): Result<ByteArray?>
     suspend fun write(key: String, data: ByteArray): Result<Unit>
     suspend fun delete(key: String): Result<Unit>
+    suspend fun append(key: String, data: ByteArray): Result<Unit>
 }
 
 class InMemoryFsStorage : FsStorage {
@@ -726,6 +729,12 @@ class InMemoryFsStorage : FsStorage {
 
     override suspend fun delete(key: String): Result<Unit> {
         data.remove(key)
+        return Result.success(Unit)
+    }
+
+    override suspend fun append(key: String, data: ByteArray): Result<Unit> {
+        val existing = this.data[key] ?: ByteArray(0)
+        this.data[key] = existing + data
         return Result.success(Unit)
     }
 }
