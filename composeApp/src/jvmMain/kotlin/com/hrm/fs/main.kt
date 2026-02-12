@@ -5,11 +5,12 @@ import androidx.compose.ui.window.application
 import com.hrm.fs.platform.createDiskFileOperations
 
 fun main() = application {
-    val diskOps = createDiskFileOperations(System.getProperty("user.home") + "/PicoFS")
+    val basePath = System.getProperty("user.home") + "/PicoFS"
+    val diskOps = createDiskFileOperations(basePath)
     Window(
         onCloseRequest = ::exitApplication,
         title = "PicoFS",
     ) {
-        App(diskOps = diskOps)
+        App(diskOps = diskOps, storageDirPath = basePath)
     }
 }

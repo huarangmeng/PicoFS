@@ -78,7 +78,22 @@ import com.hrm.fs.api.FsMeta
 import com.hrm.fs.api.FsType
 import com.hrm.fs.api.TrashItem
 import com.hrm.fs.core.createFileSystem
+import com.hrm.fs.platform.createPlatformFsStorage
 import kotlinx.coroutines.launch
+
+// ═════════════════════════════════════════════════════════════════
+// 运行模式
+// ═════════════════════════════════════════════════════════════════
+
+/**
+ * Demo 运行模式：
+ * - VIRTUAL: 纯虚拟文件系统
+ * - DISK:    挂载真实磁盘
+ */
+private enum class DemoMode(val label: String, val desc: String) {
+    VIRTUAL("纯虚拟", "无真实文件操作"),
+    DISK("挂载磁盘", "真实磁盘操作")
+}
 
 // ═════════════════════════════════════════════════════════════════
 // 顶层 Tab 页
@@ -92,16 +107,52 @@ private enum class AppTab(val label: String, val icon: String) {
 }
 
 @Composable
-fun App(diskOps: DiskFileOperations? = null) {
+fun App(diskOps: DiskFileOperations? = null, storageDirPath: String? = null) {
     MaterialTheme {
-        val fs = remember { createFileSystem(FsConfig()) }
         val scope = rememberCoroutineScope()
         val snackbar = remember { SnackbarHostState() }
-        var mounted by remember { mutableStateOf(false) }
         var currentTab by remember { mutableStateOf(AppTab.FILES) }
 
-        LaunchedEffect(diskOps) {
-            if (diskOps != null && !mounted) {
+        // ── 模式选择 ──
+        var demoMode by remember { mutableStateOf(DemoMode.VIRTUAL) }
+        var modeConfirmed by remember { mutableStateOf(false) }
+
+        if (!modeConfirmed) {
+            ModeSelector(
+                hasDiskOps = diskOps != null,
+                hasStoragePath = storageDirPath != null,
+                onSelect = { mode ->
+                    demoMode = mode
+                    modeConfirmed = true
+                }
+            )
+            return@MaterialTheme
+        }
+
+        // ── 根据模式创建 FileSystem ──
+        val fsState = remember(demoMode) {
+            when (demoMode) {
+                DemoMode.VIRTUAL -> {
+                    val storage = if (storageDirPath != null) {
+                        createPlatformFsStorage(storageDirPath + "/vfs_storage")
+                    } else null
+                    createFileSystem(FsConfig(storage = storage)) to
+                        if (storage != null) "纯虚拟 (平台持久化)" else "纯虚拟 (内存, 重启丢失)"
+                }
+                DemoMode.DISK -> {
+                    val storage = if (storageDirPath != null) {
+                        createPlatformFsStorage(storageDirPath + "/vfs_storage")
+                    } else null
+                    createFileSystem(FsConfig(storage = storage)) to "挂载磁盘"
+                }
+            }
+        }
+        val fs = fsState.first
+        val modeLabel = fsState.second
+        var mounted by remember(demoMode) { mutableStateOf(false) }
+
+        LaunchedEffect(demoMode, diskOps) {
+            if (demoMode == DemoMode.DISK && diskOps != null && !mounted) {
                 fs.mounts.mount("/disk", diskOps).fold(
                     { mounted = true },
                     { snackbar.showSnackbar("挂载失败: ${it.message}") }
@@ -144,7 +195,95 @@ fun App(diskOps: DiskFileOperations? = null) {
                     TrashPage(fs = fs, modifier = Modifier.fillMaxSize(), onMessage = msg)
                 }
                 Box(if (currentTab == AppTab.METRICS) show else hide) {
-                    MetricsPage(fs = fs, modifier = Modifier.fillMaxSize())
+                    MetricsPage(fs = fs, modeLabel = modeLabel, modifier = Modifier.fillMaxSize(),
+                        onSwitchMode = { modeConfirmed = false; currentTab = AppTab.FILES })
+                }
+            }
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════
+// 模式选择页面
+// ═════════════════════════════════════════════════════════════════
+
+@Composable
+private fun ModeSelector(
+    hasDiskOps: Boolean,
+    hasStoragePath: Boolean,
+    onSelect: (DemoMode) -> Unit
+) {
+    MaterialTheme {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Card(
+                modifier = Modifier.padding(32.dp).fillMaxWidth(),
+                elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+            ) {
+                Column(
+                    modifier = Modifier.padding(24.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    Text("PicoFS Demo",
+                        style = MaterialTheme.typography.headlineMedium,
+                        fontWeight = FontWeight.Bold)
+                    Text("请选择运行模式",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+                    Spacer(Modifier.height(8.dp))
+
+                    // 纯虚拟模式
+                    ElevatedCard(
+                        modifier = Modifier.fillMaxWidth().clickable { onSelect(DemoMode.VIRTUAL) },
+                        colors = CardDefaults.elevatedCardColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer
+                        )
+                    ) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text("纯虚拟文件系统",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer)
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                if (hasStoragePath)
+                                    "使用平台文件持久化 (createPlatformFsStorage)\n完整测试 Snapshot / WAL / Codec 编解码路径\n重启后数据不丢失"
+                                else
+                                    "纯内存模式（未传入 storageDirPath）\n重启后数据会丢失",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f),
+                                lineHeight = 18.sp)
+                        }
+                    }
+
+                    // 挂载磁盘模式
+                    ElevatedCard(
+                        modifier = Modifier.fillMaxWidth().then(
+                            if (hasDiskOps) Modifier.clickable { onSelect(DemoMode.DISK) } else Modifier
+                        ),
+                        colors = CardDefaults.elevatedCardColors(
+                            containerColor = if (hasDiskOps)
+                                MaterialTheme.colorScheme.secondaryContainer
+                            else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                        )
+                    ) {
+                        Column(Modifier.padding(16.dp)) {
+                            Text("挂载磁盘",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = if (hasDiskOps) MaterialTheme.colorScheme.onSecondaryContainer
+                                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f))
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                if (hasDiskOps) "挂载真实磁盘目录到 /disk\n测试磁盘文件操作"
+                                else "当前平台未提供 DiskFileOperations\n请传入 diskOps 参数",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (hasDiskOps) MaterialTheme.colorScheme.onSecondaryContainer.copy(alpha = 0.8f)
+                                        else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                                lineHeight = 18.sp)
+                        }
+                    }
                 }
             }
         }
@@ -613,7 +752,9 @@ private fun TrashPage(
 @Composable
 private fun MetricsPage(
     fs: FileSystem,
-    modifier: Modifier = Modifier
+    modeLabel: String = "",
+    modifier: Modifier = Modifier,
+    onSwitchMode: () -> Unit = {}
 ) {
     val scope = rememberCoroutineScope()
     var metricsText by remember { mutableStateOf("") }
@@ -674,6 +815,27 @@ private fun MetricsPage(
             }
         }
         Spacer(Modifier.height(12.dp))
+
+        // ── 当前模式卡片 ──
+        Card(
+            Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+        ) {
+            Row(
+                Modifier.fillMaxWidth().padding(14.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column {
+                    Text("当前模式", fontSize = 12.sp,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f))
+                    Text(modeLabel, fontWeight = FontWeight.Bold, fontSize = 14.sp,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer)
+                }
+                FilledTonalButton(onClick = onSwitchMode) { Text("切换模式", fontSize = 12.sp) }
+            }
+        }
+        Spacer(Modifier.height(8.dp))
 
         MonoCard(quotaText)
         Spacer(Modifier.height(8.dp))

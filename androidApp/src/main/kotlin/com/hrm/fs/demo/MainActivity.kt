@@ -17,7 +17,8 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
 
-        val diskOps = createDiskFileOperations(filesDir.absolutePath)
+        val basePath = filesDir.absolutePath
+        val diskOps = createDiskFileOperations(basePath)
         FLog.setLogger(object : IFsLogger {
             override fun v(tag: String, message: String) {
                 Log.v(tag, message)
@@ -45,7 +46,7 @@ class MainActivity : ComponentActivity() {
 
         })
         setContent {
-            App(diskOps = diskOps)
+            App(diskOps = diskOps, storageDirPath = basePath)
         }
     }
 }

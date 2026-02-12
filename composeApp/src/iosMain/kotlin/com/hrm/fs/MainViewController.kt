@@ -5,6 +5,7 @@ import com.hrm.fs.platform.createDiskFileOperations
 import platform.Foundation.NSHomeDirectory
 
 fun MainViewController() = ComposeUIViewController {
-    val diskOps = createDiskFileOperations(NSHomeDirectory() + "/Documents/PicoFS")
-    App(diskOps = diskOps)
+    val basePath = NSHomeDirectory() + "/Documents/PicoFS"
+    val diskOps = createDiskFileOperations(basePath)
+    App(diskOps = diskOps, storageDirPath = basePath)
 }
