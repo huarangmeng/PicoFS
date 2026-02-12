@@ -43,6 +43,7 @@ import com.hrm.fs.core.persistence.PersistenceConfig
 import com.hrm.fs.core.persistence.SnapshotPermissions
 import com.hrm.fs.core.persistence.SnapshotTrashData
 import com.hrm.fs.core.persistence.WalEntry
+import kotlin.concurrent.Volatile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -98,6 +99,16 @@ internal class InMemoryFileSystem(
     internal val statCache = VfsCache<String, FsMeta>(256)
     internal val readDirCache = VfsCache<String, List<FsEntry>>(128)
 
+    /**
+     * 快速路径标志：持久化数据是否已加载。
+     *
+     * 用 @Volatile 保证多线程可见性。一旦 persistence.ensureLoaded() 返回
+     * 并完成恢复，后续所有操作都跳过 writeLock + ensureLoaded，
+     * 消除"每次操作都取 writeLock"的开销。
+     */
+    @Volatile
+    private var persistenceLoaded = false
+
     /** 挂载点文件的 xattr overlay（挂载点路径 -> name -> value） */
     internal val mountXattrs = LinkedHashMap<String, MutableMap<String, ByteArray>>()
 
@@ -128,7 +139,7 @@ internal class InMemoryFileSystem(
 
     override suspend fun createFile(path: String): Result<Unit> {
         FLog.d(TAG, "createFile: path=$path")
-        writeLocked { ensureLoaded() }
+        ensureLoadedFastPath()
         val mark = mc.begin()
         val result = writeLocked {
             createFileNoLock(PathUtils.normalize(path))
@@ -139,7 +150,7 @@ internal class InMemoryFileSystem(
 
     override suspend fun createDir(path: String): Result<Unit> {
         FLog.d(TAG, "createDir: path=$path")
-        writeLocked { ensureLoaded() }
+        ensureLoadedFastPath()
         val mark = mc.begin()
         val result = writeLocked {
             createDirNoLock(PathUtils.normalize(path))
@@ -150,7 +161,7 @@ internal class InMemoryFileSystem(
 
     override suspend fun open(path: String, mode: OpenMode): Result<FileHandle> {
         FLog.d(TAG, "open: path=$path, mode=$mode")
-        writeLocked { ensureLoaded() }
+        ensureLoadedFastPath()
         val mark = mc.begin()
         val result = readLocked {
             openNoLock(PathUtils.normalize(path), mode)
@@ -160,7 +171,7 @@ internal class InMemoryFileSystem(
     }
 
     override suspend fun readDir(path: String): Result<List<FsEntry>> {
-        writeLocked { ensureLoaded() }
+        ensureLoadedFastPath()
         val mark = mc.begin()
         val result = readLocked {
             readDirNoLock(PathUtils.normalize(path))
@@ -170,7 +181,7 @@ internal class InMemoryFileSystem(
     }
 
     override suspend fun stat(path: String): Result<FsMeta> {
-        writeLocked { ensureLoaded() }
+        ensureLoadedFastPath()
         val mark = mc.begin()
         val result = readLocked {
             statNoLock(PathUtils.normalize(path))
@@ -181,7 +192,7 @@ internal class InMemoryFileSystem(
 
     override suspend fun delete(path: String): Result<Unit> {
         FLog.d(TAG, "delete: path=$path")
-        writeLocked { ensureLoaded() }
+        ensureLoadedFastPath()
         val mark = mc.begin()
         val result = writeLocked {
             deleteNoLock(PathUtils.normalize(path))
@@ -191,7 +202,7 @@ internal class InMemoryFileSystem(
     }
 
     override suspend fun setPermissions(path: String, permissions: FsPermissions): Result<Unit> {
-        writeLocked { ensureLoaded() }
+        ensureLoadedFastPath()
         val mark = mc.begin()
         val result = writeLocked {
             val normalized = PathUtils.normalize(path)
@@ -229,7 +240,7 @@ internal class InMemoryFileSystem(
     // ═══════════════════════════════════════════════════════════
 
     override suspend fun readAll(path: String): Result<ByteArray> {
-        writeLocked { ensureLoaded() }
+        ensureLoadedFastPath()
         val mark = mc.begin()
         val result = readLocked {
             val normalized = PathUtils.normalize(path)
@@ -243,7 +254,7 @@ internal class InMemoryFileSystem(
 
     override suspend fun writeAll(path: String, data: ByteArray): Result<Unit> {
         FLog.d(TAG, "writeAll: path=$path, size=${data.size}")
-        writeLocked { ensureLoaded() }
+        ensureLoadedFastPath()
         val mark = mc.begin()
         val result = writeLocked {
             writeAllNoLock(PathUtils.normalize(path), data)
@@ -258,7 +269,7 @@ internal class InMemoryFileSystem(
 
     override suspend fun copy(srcPath: String, dstPath: String): Result<Unit> {
         FLog.d(TAG, "copy: src=$srcPath, dst=$dstPath")
-        writeLocked { ensureLoaded() }
+        ensureLoadedFastPath()
         val mark = mc.begin()
         val result = writeLocked {
             val src = PathUtils.normalize(srcPath)
@@ -274,7 +285,7 @@ internal class InMemoryFileSystem(
 
     override suspend fun move(srcPath: String, dstPath: String): Result<Unit> {
         FLog.d(TAG, "move: src=$srcPath, dst=$dstPath")
-        writeLocked { ensureLoaded() }
+        ensureLoadedFastPath()
         val mark = mc.begin()
         val result = writeLocked {
             val src = PathUtils.normalize(srcPath)
@@ -599,7 +610,7 @@ internal class InMemoryFileSystem(
         override suspend fun list(): List<String> = readLocked { mountTable.listMounts() }
 
         override suspend fun pending(): List<PendingMount> {
-            writeLocked { ensureLoaded() }
+            ensureLoadedFastPath()
             return readLocked {
                 mountTable.pendingMounts().map { info ->
                     PendingMount(info.virtualPath, info.rootPath, info.readOnly)
@@ -609,7 +620,7 @@ internal class InMemoryFileSystem(
 
         override suspend fun sync(path: String): Result<List<FsEvent>> {
             FLog.d(TAG, "sync: path=$path")
-            writeLocked { ensureLoaded() }
+            ensureLoadedFastPath()
             val mark = mc.begin()
             val result = writeLocked {
                 val normalized = PathUtils.normalize(path)
@@ -662,7 +673,7 @@ internal class InMemoryFileSystem(
 
     private inner class VersionsImpl : FsVersions {
         override suspend fun list(path: String): Result<List<FileVersion>> {
-            writeLocked { ensureLoaded() }
+            ensureLoadedFastPath()
             return readLocked {
                 val normalized = PathUtils.normalize(path)
                 val meta = statInternal(normalized).getOrElse { return@readLocked Result.failure(it) }
@@ -672,7 +683,7 @@ internal class InMemoryFileSystem(
         }
 
         override suspend fun read(path: String, versionId: String): Result<ByteArray> {
-            writeLocked { ensureLoaded() }
+            ensureLoadedFastPath()
             return readLocked {
                 val normalized = PathUtils.normalize(path)
                 versionManager.readVersion(normalized, versionId)
@@ -721,7 +732,7 @@ internal class InMemoryFileSystem(
 
     private inner class SearchImpl : FsSearch {
         override suspend fun find(query: SearchQuery): Result<List<SearchResult>> {
-            writeLocked { ensureLoaded() }
+            ensureLoadedFastPath()
             return readLocked {
             val rootPath = PathUtils.normalize(query.rootPath)
             FLog.d(TAG, "find: rootPath=$rootPath, namePattern=${query.namePattern}, contentPattern=${query.contentPattern}")
@@ -891,7 +902,7 @@ internal class InMemoryFileSystem(
 
     private inner class ChecksumImpl : FsChecksum {
         override suspend fun compute(path: String, algorithm: ChecksumAlgorithm): Result<String> {
-            writeLocked { ensureLoaded() }
+            ensureLoadedFastPath()
             return readLocked {
                 val normalized = PathUtils.normalize(path)
                 FLog.d(TAG, "checksum: path=$normalized, algorithm=$algorithm")
@@ -955,7 +966,7 @@ internal class InMemoryFileSystem(
         }
 
         override suspend fun get(path: String, name: String): Result<ByteArray> {
-            writeLocked { ensureLoaded() }
+            ensureLoadedFastPath()
             return readLocked {
                 val normalized = PathUtils.normalize(path)
                 val match = mountTable.findMount(normalized)
@@ -997,7 +1008,7 @@ internal class InMemoryFileSystem(
         }
 
         override suspend fun list(path: String): Result<List<String>> {
-            writeLocked { ensureLoaded() }
+            ensureLoadedFastPath()
             return readLocked {
                 val normalized = PathUtils.normalize(path)
                 val match = mountTable.findMount(normalized)
@@ -1041,7 +1052,7 @@ internal class InMemoryFileSystem(
 
         override suspend fun readLink(path: String): Result<String> {
             FLog.d(TAG, "readLink: path=$path")
-            writeLocked { ensureLoaded() }
+            ensureLoadedFastPath()
             return readLocked {
                 val normalized = PathUtils.normalize(path)
                 tree.readLink(normalized)
@@ -1365,7 +1376,7 @@ internal class InMemoryFileSystem(
         }
 
         override suspend fun list(): Result<List<TrashItem>> {
-            writeLocked { ensureLoaded() }
+            ensureLoadedFastPath()
             return readLocked {
                 Result.success(trashManager.listItems())
             }
@@ -1529,7 +1540,10 @@ internal class InMemoryFileSystem(
     // ═══════════════════════════════════════════════════════════
 
     internal suspend fun ensureLoaded() {
-        val loadResult = persistence.ensureLoaded() ?: return
+        val loadResult = persistence.ensureLoaded() ?: run {
+            persistenceLoaded = true
+            return
+        }
         FLog.i(TAG, "ensureLoaded: restoring from persistence")
         loadResult.snapshot?.let {
             tree.restoreFromSnapshot(it)
@@ -1569,6 +1583,7 @@ internal class InMemoryFileSystem(
             trashManager.restoreFromSnapshot(it.entries)
             FLog.d(TAG, "ensureLoaded: restored trash data with ${it.entries.size} entries")
         }
+        persistenceLoaded = true
     }
 
     internal suspend fun walAppend(entry: WalEntry) {
@@ -1607,12 +1622,21 @@ internal class InMemoryFileSystem(
         persistence.persistTrash(SnapshotTrashData(trashManager.toSnapshotEntries()))
     }
 
+    /**
+     * 快速路径 ensureLoaded：已加载后仅需一次 volatile 读（无锁）。
+     * 未加载时取 writeLock 执行完整加载流程。
+     */
+    private suspend fun ensureLoadedFastPath() {
+        if (persistenceLoaded) return
+        writeLocked { ensureLoaded() }
+    }
+
     /** TreeLock 读锁：保护路径解析和节点读取。 */
     internal suspend fun <T> readLocked(block: suspend () -> T): T = treeLock.withReadLock { block() }
     /** TreeLock 写锁：保护树结构变更（create/delete/move）。 */
     internal suspend fun <T> writeLocked(block: suspend () -> T): T = treeLock.withWriteLock { block() }
 
-    internal fun invalidateCache(path: String) {
+    internal suspend fun invalidateCache(path: String) {
         statCache.remove(path)
         readDirCache.remove(path)
         val parent = path.substringBeforeLast('/', "/")

@@ -85,9 +85,9 @@ internal class VfsTrashManager(
             }
     }
 
-    /** trashId → TrashEntry，使用 ArrayList 维护插入顺序（最新在前）。 */
+    /** trashId → TrashEntry，使用 ArrayDeque 维护插入顺序（最新在前）。 */
     private val storeMap = LinkedHashMap<String, TrashEntry>()
-    private val storeOrder = ArrayList<String>() // 索引 0 = 最新
+    private val storeOrder = ArrayDeque<String>() // front = 最新
 
     /** 当前回收站总字节数缓存。 */
     private var _totalBytes: Long = 0L
@@ -113,9 +113,9 @@ internal class VfsTrashManager(
             children = children,
             isMounted = false
         )
-        // 插入到头部（O(n) shift 但比创建全新 LinkedHashMap 开销小）
+        // 插入到头部（ArrayDeque.addFirst 是 O(1) 均摊，比 ArrayList.add(0) O(n) 高效）
         storeMap[trashId] = entry
-        storeOrder.add(0, trashId)
+        storeOrder.addFirst(trashId)
         _totalBytes += entry.size
         trimOldest()
         FLog.d(TAG, "moveToTrash: trashId=$trashId, path=$originalPath, type=$type")
@@ -138,7 +138,7 @@ internal class VfsTrashManager(
             isMounted = true
         )
         storeMap[trashId] = entry
-        storeOrder.add(0, trashId)
+        storeOrder.addFirst(trashId)
         _totalBytes += entry.size
         trimOldest()
         FLog.d(TAG, "recordMountedTrash: trashId=$trashId, path=$originalPath")
@@ -190,7 +190,7 @@ internal class VfsTrashManager(
     private fun trimOldest() {
         while (storeOrder.size > maxItems || (maxBytes >= 0 && _totalBytes > maxBytes)) {
             if (storeOrder.isEmpty()) break
-            val oldestId = storeOrder.removeAt(storeOrder.size - 1)
+            val oldestId = storeOrder.removeLast()
             val removed = storeMap.remove(oldestId)
             if (removed != null) {
                 _totalBytes -= removed.size

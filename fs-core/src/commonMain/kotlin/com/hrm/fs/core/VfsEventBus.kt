@@ -36,11 +36,14 @@ internal class VfsEventBus {
 
     /**
      * 监听 [path] 及其子路径下的事件。
+     *
+     * 前缀字符串在订阅时预计算，避免每次事件触发时重复拼接。
      */
     fun watch(path: String): Flow<FsEvent> {
         val normalized = PathUtils.normalize(path)
+        val childPrefix = "$normalized/"
         return flow.asSharedFlow().filter { event ->
-            event.path == normalized || event.path.startsWith("$normalized/")
+            event.path == normalized || event.path.startsWith(childPrefix)
         }
     }
 }

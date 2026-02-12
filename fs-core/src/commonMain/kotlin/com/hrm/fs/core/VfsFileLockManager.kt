@@ -32,6 +32,13 @@ internal class VfsFileLockManager {
     private val locks = LinkedHashMap<String, LockState>()
 
     /**
+     * 反向索引：handleId → 该 handle 持有锁的路径集合。
+     * 用于 [unlockAll] 和 [getLockedPath] 的 O(1) 查找，
+     * 替代原来遍历全部 locks map 的 O(n) 实现。
+     */
+    private val handlePaths = LinkedHashMap<Long, MutableSet<String>>()
+
+    /**
      * 等待获取锁的挂起协程。
      * 当锁释放时，唤醒所有等待者让它们重新竞争。
      */
@@ -129,21 +136,18 @@ internal class VfsFileLockManager {
     /**
      * 释放指定句柄在所有路径上持有的锁。
      * 用于 FileHandle.close() 时调用。
+     *
+     * 通过反向索引 [handlePaths] 直接定位该 handle 持有的路径，O(持有锁数)。
      */
     suspend fun unlockAll(handleId: Long) {
         mutex.withLock {
-            val pathsToNotify = mutableListOf<String>()
-            val iterator = locks.iterator()
-            while (iterator.hasNext()) {
-                val (path, state) = iterator.next()
-                if (state.holders.remove(handleId)) {
-                    pathsToNotify.add(path)
-                    if (state.holders.isEmpty()) {
-                        iterator.remove()
-                    }
+            val paths = handlePaths.remove(handleId) ?: return@withLock
+            for (path in paths) {
+                val state = locks[path] ?: continue
+                state.holders.remove(handleId)
+                if (state.holders.isEmpty()) {
+                    locks.remove(path)
                 }
-            }
-            for (path in pathsToNotify) {
                 notifyWaiters(path)
             }
         }
@@ -170,13 +174,11 @@ internal class VfsFileLockManager {
 
     /**
      * 获取指定句柄当前持有锁的路径（用于 close 时需要知道释放了哪些路径）。
+     * 通过反向索引 O(1) 查找。
      */
     suspend fun getLockedPath(handleId: Long): String? {
         mutex.withLock {
-            for ((path, state) in locks) {
-                if (handleId in state.holders) return path
-            }
-            return null
+            return handlePaths[handleId]?.firstOrNull()
         }
     }
 
@@ -209,6 +211,8 @@ internal class VfsFileLockManager {
             // 共享锁追加
             state.holders.add(handleId)
         }
+        // 维护反向索引
+        handlePaths.getOrPut(handleId) { mutableSetOf() }.add(path)
     }
 
     private fun releaseLockInternal(path: String, handleId: Long) {
@@ -216,6 +220,11 @@ internal class VfsFileLockManager {
         state.holders.remove(handleId)
         if (state.holders.isEmpty()) {
             locks.remove(path)
+        }
+        // 维护反向索引
+        handlePaths[handleId]?.let { paths ->
+            paths.remove(path)
+            if (paths.isEmpty()) handlePaths.remove(handleId)
         }
     }
 
